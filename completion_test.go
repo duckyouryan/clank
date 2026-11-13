@@ -54,7 +54,7 @@ func TestCompletionCoversCommands(t *testing.T) {
 			}
 		}
 	}
-	for _, flag := range []string{"-c", "-r", "-v", "-q", "-i", "--yolo", "--reasoning", "--image"} {
+	for _, flag := range []string{"-c", "-r", "-v", "-q", "-i", "-p", "-m", "--mode", "--reasoning", "--image", "--profile", "--model"} {
 		for shell, s := range scripts {
 			if !containsWord(s, flag) {
 				t.Errorf("%s script misses ask flag %q", shell, flag)
@@ -63,8 +63,21 @@ func TestCompletionCoversCommands(t *testing.T) {
 	}
 }
 
+// containsWord ищет слово целиком. В fish флаги пишутся как `-l name`
+// и `-s x`, поэтому "--name" и "-x" засчитываются и в такой форме.
 func containsWord(s, w string) bool {
 	re := regexp.MustCompile(`(^|[^a-z-])` + regexp.QuoteMeta(w) + `([^a-z-]|$)`)
+	if re.MatchString(s) {
+		return true
+	}
+	switch {
+	case strings.HasPrefix(w, "--"):
+		re = regexp.MustCompile(`-l ` + regexp.QuoteMeta(strings.TrimPrefix(w, "--")) + `([^a-z-]|$)`)
+	case strings.HasPrefix(w, "-") && len(w) == 2:
+		re = regexp.MustCompile(`-s ` + regexp.QuoteMeta(w[1:]) + `([^a-z-]|$)`)
+	default:
+		return false
+	}
 	return re.MatchString(s)
 }
 

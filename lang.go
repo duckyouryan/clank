@@ -20,43 +20,31 @@ const (
 // Msgs — все строки интерфейса на одном языке. Форматные глаголы (%s, %d)
 // обязаны совпадать в обеих таблицах.
 type Msgs struct {
-	Usage        string
-	SessionUsage string
-	ConfigUsage  string
-	ModelsHelp   string
-
-	LangNameRU string
-	LangNameEN string
-	FailPrefix string
-	LangShow   string
-	LangSaved  string
-	LangBadArg string
-
-	HelpAsk           string
-	HelpConfigInit    string
-	HelpConfigAdd     string
-	HelpConfigUse     string
-	HelpConfigList    string
-	HelpConfigRm      string
-	HelpConfigShow    string
-	HelpConfigSet     string
-	HelpTestTools     string
-	HelpTestReasoning string
-	HelpTestVision    string
-	HelpTestModel     string
-	HelpConfigAllow   string
-	HelpSessionShow   string
-	HelpSessionClear  string
-	HelpSessionList   string
-	HelpYolo          string
-	HelpLanguage      string
-	HelpUpdate        string
-	HelpPurge         string
-	HelpUninstall     string
-	HelpNuke          string
-	HelpUnknown       string
-	HelpTopics        string
-
+	Usage               string
+	SessionUsage        string
+	ConfigUsage         string
+	ModelsHelp          string
+	LangNameRU          string
+	LangNameEN          string
+	FailPrefix          string
+	LangShow            string
+	LangSaved           string
+	LangBadArg          string
+	HelpAsk             string
+	HelpConfigUse       string
+	HelpConfigList      string
+	HelpConfigRm        string
+	HelpConfigShow      string
+	HelpSessionShow     string
+	HelpSessionClear    string
+	HelpSessionList     string
+	HelpLanguage        string
+	HelpUpdate          string
+	HelpPurge           string
+	HelpUninstall       string
+	HelpNuke            string
+	HelpUnknown         string
+	HelpTopics          string
 	CompletionUsage     string
 	CompletionBadShell  string
 	CompletionDone      string
@@ -66,281 +54,244 @@ type Msgs struct {
 	CompletionNone      string
 	AskCompletion       string
 	HelpCompletion      string
-
-	// ask.go
-	StdinReadFail  string
-	ImageFlagNeeds string
-	BadYoloFlag    string
-	BadReasonFlag  string
-	UnknownFlag    string
-	NothingToAsk   string
-	AskUsage       string
-	ProfileDetail  string
-	ReadingStdin   string
-	StdinBytes     string
-	ContextWrap    string
-	ImageAttached  string
-	SessionSaveErr string
-	Thinking       string
-	StepDetail     string
-	AnswerCut      string
-	Interrupted    string
-	OutcomeIntr    string
-	OutcomeEmpty   string
-	UnknownTool    string
-	NoSuchTool     string
-	ViewArgsBad    string
-	ViewArgsNeed   string
-	ViewEmptyPath  string
-	ViewPathEmpty  string
-	ViewWatch      string
-	ViewOpenFail   string
-	ViewReadFail   string
-	ViewLoaded     string
-	ViewContent    string
-	AskArgsBad     string
-	AskArgsNeed    string
-	AskEmptyQ      string
-	AskQEmpty      string
-	AskNoTTY       string
-	AskCancelled   string
-	ShellArgsBad   string
-	ShellArgsNeed  string
-	ShellEmpty     string
-	ShellCmdEmpty  string
-	RunYolo        string
-	RunAlways      string
-	RunSimple      string
-	UserDeclined   string
-	AllowSaveFail  string
-	AllowAll       string
-	AllowSimple    string
-	OutputMark     string
-	CmdInterrupted string
-	CmdTimedOut    string
-	OutputCut      string
-	RunStartFail   string
-	ExecTooLong    string
-
-	// config.go
-	ConfigCorrupt  string
-	ActiveNotFound string
-	ActiveSaveFail string
-	ActiveSwitch   string
-	ProfileInvalid string
-	KeyMissing     string
-
-	// configcmd.go
-	NeedProfileName   string
-	NoSuchProfile     string
-	NoSuchProfileList string
-	SaveFail          string
-	ActiveProfileIs   string
-	NoProfiles        string
-	ActiveRemoved     string
-	RemovedIs         string
-	ShowFile          string
-	ShowProfile       string
-	ShowNotSet        string
-	ShowModelsNone    string
-	ShowModelsHead    string
-	ShowNoEnvProxy    string
-	ShowThinkOn       string
-	ShowThinkOff      string
-	ShowThinkCal      string
-	ShowThinkPlain    string
-	ShowThinkAuto     string
-	ShowVisionOn      string
-	ShowVisionOff     string
-	ShowVisionAuto    string
-	ShowTimeout       string
-	ShowYoloOn        string
-	ShowAllowed       string
-	ShowLanguage      string
-	ShowLangAuto      string
-	NeedValue         string
-	ModelsEmpty       string
-	BadSetReason      string
-	BadTimeout        string
-	SavedOK           string
-	AllowNeedName     string
-	AllowNotListed    string
-	AllowRemoved      string
-	AllowCleared      string
-	UnknownSubcommand string
-	WizardNeedsTTY    string
-	WizardTitle       string
-	ConfigSaveFail    string
-	ProfileSaved      string
-	AskFetchModels    string
-	ModelsFetchFail   string
-	AskModelLine      string
-	ProfileNoModel    string
-	AskTestTools      string
-	ToolsSkipLater    string
-	ModelsNeedCreds   string
-	FetchingModels    string
-	FilterNoMatch     string
-	ModelsEmptyAPI    string
-	ChainHint         string
-	AskChainNumbers   string
-	Cancelled         string
-	BadNumber         string
-	ModelSet          string
-	ChainSet          string
-	TestToolsCheck    string
-	WaitingAnswer     string
-	ToolCalled        string
-	ToolNotCalled     string
-	ChainFirstOnly    string
-	AskSaveTools      string
-	SavedNot          string
-	TestReasonCheck   string
-	TestingParams     string
-	ReasonResults     string
-	ReasonNone        string
-	ReasonEffortOK    string
-	ReasonBudgetOK    string
-	ReasonNoParams    string
-	ReasonHasOutput   string
-	ReasonNoOutput    string
-	ReasonUnsupported string
-	AskReasonOn       string
-	SavedReasonOn     string
-	SettingsKept      string
-	TestVisionCheck   string
-	VisionOK          string
-	VisionJudge       string
-	VisionFail        string
-	AskSaveVision     string
-	TestModelCheck    string
-	AskSaveModel      string
-	YoloIsOn          string
-	YoloIsOff         string
-	YoloGlobalOn      string
-	YoloGlobalOff     string
-	YoloBadArg        string
-
-	// client.go
-	ErrSetup   string
-	ErrNoConn  string
-	ModelParen string
-	ErrShort   string
-	NoConn     string
-	HintAuth   string
-	HintURL    string
-	HintModel  string
-	HintCtx    string
-	HintRate   string
-	HintNet    string
-	ProxyParse string
-	ProxyBlind string
-	RespUnpars string
-	EmptyChoi  string
-	ReqDetail  string
-	RespDetail string
-	NoModels   string
-	Answering  string
-	ModelFail  string
-	RetryIn    string
-	NoAnswer   string
-	ModelsUnp  string
-	APIError   string
-	ToolProbeS string
-	ToolProbeU string
-	VisionProb string
-	ImageBig   string
-	ImageType  string
-
-	// lifecycle.go
-	PurgeEmpty   string
-	PurgeAsk     string
-	Aborted      string
-	PurgeFail    string
-	PurgeDone    string
-	BinPathFail  string
-	UninstAsk    string
-	UninstFail   string
-	UninstDone   string
-	NukeAsk      string
-	NukePartFail string
-	NukeDataErr  string
-	NukeBinErr   string
-	NukeDone     string
-
-	// session.go
-	SessPathFail  string
-	SessFresh     string
-	SessReadFail  string
-	SessCorrupt   string
-	SessSwitch    string
-	SessDetail    string
-	SessEmpty     string
-	SessReadErr   string
-	SessFileBad   string
-	SessHeader    string
-	MarkDone      string
-	MarkAnswer    string
-	MarkImage     string
-	MarkAsks      string
-	MarkViews     string
-	MarkRuns      string
-	MarkAsst      string
-	SessRemoved   string
-	NoSessions    string
-	SessClearDone string
-	SessClearFail string
-	SessClearOne  string
-	StClosed      string
-	StShellAlive  string
-	StHeadless    string
-	SessRow       string
-
-	// tty.go
-	ConfirmHint   string
-	NoTTYDecline  string
-	ModelWantsRun string
-	ComplexWarn   string
-	RunPromptAll  string
-	RunPrompt     string
-	ConfirmCMD    string
-	NoTTYDefault  string
-	NoTTYNoAnswer string
-	ChooseOrType  string
-	ChooseOrDef   string
-	AnswerOrDef   string
-	AnswerIs      string
-	EnterNum      string
-
-	// update.go
-	UpdBinFail  string
-	UpdLinkFail string
-	UpdChecking string
-	UpdCheckErr string
-	UpdLatest   string
-	UpdAvail    string
-	UpdNotes    string
-	UpdCached   string
-	UpdAsk      string
-	UpdAbort    string
-	UpdDown     string
-	UpdDownErr  string
-	UpdUnpErr   string
-	UpdKept     string
-	UpdCacheErr string
-	UpdApplyErr string
-	UpdSudoHint string
-	UpdDone     string
-	UpdNoAsset  string
-	UpdNoExeZip string
-	UpdNoExeTar string
-	UpdNoSums   string
-	UpdSumBad   string
-	UpdSumOK    string
-
-	// systemprompt_unix.go
-	ShellApprox  string
-	ShellUnknown string
+	StdinReadFail       string
+	UnknownFlag         string
+	NothingToAsk        string
+	AskUsage            string
+	ProfileDetail       string
+	ReadingStdin        string
+	StdinBytes          string
+	ContextWrap         string
+	ImageAttached       string
+	SessionSaveErr      string
+	Thinking            string
+	StepDetail          string
+	AnswerCut           string
+	Interrupted         string
+	OutcomeIntr         string
+	OutcomeEmpty        string
+	UnknownTool         string
+	AskEmptyQ           string
+	ShellEmpty          string
+	OutputMark          string
+	OutputCut           string
+	RunStartFail        string
+	ExecTooLong         string
+	ConfigCorrupt       string
+	ActiveNotFound      string
+	ActiveSaveFail      string
+	ActiveSwitch        string
+	ProfileInvalid      string
+	KeyMissing          string
+	NeedProfileName     string
+	NoSuchProfileList   string
+	SaveFail            string
+	ActiveProfileIs     string
+	NoProfiles          string
+	ActiveRemoved       string
+	RemovedIs           string
+	ShowFile            string
+	ShowProfile         string
+	ShowNotSet          string
+	ShowTimeout         string
+	ShowLanguage        string
+	ShowLangAuto        string
+	BadTimeout          string
+	UnknownSubcommand   string
+	ProfileNoModel      string
+	FetchingModels      string
+	FilterNoMatch       string
+	ModelsEmptyAPI      string
+	ErrSetup            string
+	ErrNoConn           string
+	ModelParen          string
+	ErrShort            string
+	NoConn              string
+	HintAuth            string
+	HintURL             string
+	HintModel           string
+	HintCtx             string
+	HintRate            string
+	HintNet             string
+	ProxyParse          string
+	ProxyBlind          string
+	RespUnpars          string
+	EmptyChoi           string
+	ReqDetail           string
+	RespDetail          string
+	NoModels            string
+	Answering           string
+	ModelFail           string
+	RetryIn             string
+	NoAnswer            string
+	ModelsUnp           string
+	APIError            string
+	ImageBig            string
+	ImageType           string
+	PurgeEmpty          string
+	PurgeAsk            string
+	Aborted             string
+	PurgeFail           string
+	PurgeDone           string
+	BinPathFail         string
+	UninstAsk           string
+	UninstFail          string
+	UninstDone          string
+	NukeAsk             string
+	NukePartFail        string
+	NukeDataErr         string
+	NukeBinErr          string
+	NukeDone            string
+	SessPathFail        string
+	SessFresh           string
+	SessReadFail        string
+	SessCorrupt         string
+	SessSwitch          string
+	SessDetail          string
+	SessEmpty           string
+	SessReadErr         string
+	SessFileBad         string
+	SessHeader          string
+	MarkDone            string
+	MarkAnswer          string
+	MarkImage           string
+	MarkAsks            string
+	MarkViews           string
+	MarkRuns            string
+	MarkAsst            string
+	SessRemoved         string
+	NoSessions          string
+	SessClearDone       string
+	SessClearFail       string
+	SessClearOne        string
+	StClosed            string
+	StShellAlive        string
+	StHeadless          string
+	SessRow             string
+	ConfirmHint         string
+	NoTTYDecline        string
+	ModelWantsRun       string
+	RunPrompt           string
+	NoTTYDefault        string
+	NoTTYNoAnswer       string
+	ChooseOrType        string
+	ChooseOrDef         string
+	AnswerOrDef         string
+	AnswerIs            string
+	EnterNum            string
+	UpdBinFail          string
+	UpdLinkFail         string
+	UpdChecking         string
+	UpdCheckErr         string
+	UpdLatest           string
+	UpdAvail            string
+	UpdNotes            string
+	UpdCached           string
+	UpdAsk              string
+	UpdAbort            string
+	UpdDown             string
+	UpdDownErr          string
+	UpdUnpErr           string
+	UpdKept             string
+	UpdCacheErr         string
+	UpdApplyErr         string
+	UpdSudoHint         string
+	UpdDone             string
+	UpdNoAsset          string
+	UpdNoExeZip         string
+	UpdNoExeTar         string
+	UpdNoSums           string
+	UpdSumBad           string
+	UpdSumOK            string
+	ShellApprox         string
+	ShellUnknown        string
+	AllDisabled         string
+	BadBool             string
+	BadMode             string
+	BadPos              string
+	BadReasoning        string
+	ColModel            string
+	ColReasoning        string
+	ColTools            string
+	ColVision           string
+	ConfigMigrated      string
+	EditNothing         string
+	ErrTimeout          string
+	FlagNeedsValue      string
+	FromProfile         string
+	HelpConfigCreate    string
+	HelpConfigEdit      string
+	HelpMode            string
+	ListModels          string
+	MarkActive          string
+	MarkDisabled        string
+	ModeAskDesc         string
+	ModeAutoDesc        string
+	ModeIs              string
+	ModeReadDesc        string
+	ModelAdded          string
+	ModelExists         string
+	ModelFlagFirst      string
+	ModelUsage          string
+	ModelsHidden        string
+	ModelsNeedURL       string
+	ModelsOf            string
+	MoveUsage           string
+	NeedModelID         string
+	NeedValueFor        string
+	No                  string
+	NoModelsYet         string
+	NoSuchModel         string
+	PreviewMore         string
+	PreviewNew          string
+	PreviewOverwrite    string
+	PreviewReplaces     string
+	ProfileCreated      string
+	ProfileExists       string
+	RmAsk               string
+	RmNeedsYes          string
+	RunAuto             string
+	SavedProfile        string
+	ShowActive          string
+	ShowEnvProxy        string
+	ShowKey             string
+	ShowMode            string
+	ShowModels          string
+	ShowProvider        string
+	ShowProxy           string
+	ShowReasonDef       string
+	ShowURL             string
+	SilentFor           string
+	StreamDetail        string
+	ToolArgsBad         string
+	ToolDoing           string
+	ToolReadOnly        string
+	ToolWants           string
+	ToolWantsOut        string
+	ToolWantsSens       string
+	UnexpectedArg       string
+	WhatEdit            string
+	WhatGrep            string
+	WhatList            string
+	WhatRead            string
+	WhatView            string
+	WhatWrite           string
+	Yes                 string
+	HintForbidden       string
+	BadContext          string
+	ColContext          string
+	ContentFiltered     string
+	CtxNoBigger         string
+	CtxUnknown          string
+	EffortDropped       string
+	ErrShortCtx         string
+	HintQuota           string
+	HintTooLarge        string
+	ImagesDropped       string
+	NoToolModels        string
+	NoToolsMarked       string
+	PickPrompt          string
+	PickToolModel       string
 }
 
 // M — активная таблица строк. Переключается один раз на старте.
@@ -407,7 +358,7 @@ func initLang() {
 }
 
 // cmdHelp — `clank help [команда [подкоманда]]`. Без аргументов — общий
-// текст; с путём вроде `help config test-model` — справка по разделу.
+// текст; с путём вроде `help config create` — справка по разделу.
 func cmdHelp(args []string) int {
 	if len(args) == 0 {
 		usage()
@@ -415,42 +366,31 @@ func cmdHelp(args []string) int {
 	}
 	key := strings.ToLower(strings.Join(args, " "))
 	topics := map[string]string{
-		"ask":                     M.HelpAsk,
-		"models":                  M.ModelsHelp,
-		"config":                  M.ConfigUsage,
-		"config init":             M.HelpConfigInit,
-		"config add":              M.HelpConfigAdd,
-		"config use":              M.HelpConfigUse,
-		"config list":             M.HelpConfigList,
-		"config rm":               M.HelpConfigRm,
-		"config show":             M.HelpConfigShow,
-		"config set":              M.HelpConfigSet,
-		"config set-url":          M.HelpConfigSet,
-		"config set-key":          M.HelpConfigSet,
-		"config set-model":        M.HelpConfigSet,
-		"config set-models":       M.HelpConfigSet,
-		"config set-proxy":        M.HelpConfigSet,
-		"config set-tools":        M.HelpConfigSet,
-		"config set-reasoning":    M.HelpConfigSet,
-		"config set-exec-timeout": M.HelpConfigSet,
-		"config test-tools":       M.HelpTestTools,
-		"config test-reasoning":   M.HelpTestReasoning,
-		"config test-vision":      M.HelpTestVision,
-		"config test-model":       M.HelpTestModel,
-		"config allow-rm":         M.HelpConfigAllow,
-		"config allow-clear":      M.HelpConfigAllow,
-		"config allow":            M.HelpConfigAllow,
-		"session":                 M.SessionUsage,
-		"session show":            M.HelpSessionShow,
-		"session clear":           M.HelpSessionClear,
-		"session list":            M.HelpSessionList,
-		"yolo":                    M.HelpYolo,
-		"language":                M.HelpLanguage,
-		"completion":              M.HelpCompletion,
-		"update":                  M.HelpUpdate,
-		"purge":                   M.HelpPurge,
-		"uninstall":               M.HelpUninstall,
-		"nuke":                    M.HelpNuke,
+		"ask":           M.HelpAsk,
+		"models":        M.ModelsHelp,
+		"config":        M.ConfigUsage,
+		"config create": M.HelpConfigCreate,
+		"config edit":   M.HelpConfigEdit,
+		"config list":   M.HelpConfigList,
+		"config show":   M.HelpConfigShow,
+		"config use":    M.HelpConfigUse,
+		"config rm":     M.HelpConfigRm,
+		"config model":  M.ModelUsage,
+		"session":       M.SessionUsage,
+		"session show":  M.HelpSessionShow,
+		"session clear": M.HelpSessionClear,
+		"session list":  M.HelpSessionList,
+		"mode":          M.HelpMode,
+		"lang":          M.HelpLanguage,
+		"language":      M.HelpLanguage,
+		"completion":    M.HelpCompletion,
+		"update":        M.HelpUpdate,
+		"purge":         M.HelpPurge,
+		"uninstall":     M.HelpUninstall,
+		"nuke":          M.HelpNuke,
+	}
+	for _, verb := range []string{"list", "add", "edit", "rm", "activate", "move", "enable", "disable"} {
+		topics["config model "+verb] = M.ModelUsage
 	}
 	if t, ok := topics[key]; ok {
 		fmt.Println(t)
@@ -461,7 +401,7 @@ func cmdHelp(args []string) int {
 	return exitConfig
 }
 
-// cmdLanguage — `clank language [en|ru|auto]`: без аргумента показывает
+// cmdLanguage — `clank lang [en|ru|auto]` (старое имя language — алиас): без аргумента показывает
 // текущий язык, с аргументом — сохраняет в конфиг.
 func cmdLanguage(args []string) int {
 	cf, err := loadConfigFile()
@@ -491,8 +431,12 @@ func cmdLanguage(args []string) int {
 		fail(M.LangBadArg, args[0])
 		return exitConfig
 	}
-	if err := saveConfigFile(cf); err != nil {
-		fail(M.SaveFail, err)
+	lang := cf.Language
+	if _, err := updateConfig(func(c *ConfigFile) error {
+		c.Language = lang
+		return nil
+	}); err != nil {
+		fail("%v", err)
 		return exitConfig
 	}
 	applyLang(resolveLang(cf.Language))

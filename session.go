@@ -23,7 +23,6 @@ type sessionFile struct {
 	Profile  string        `json:"profile"`
 	Updated  time.Time     `json:"updated"`
 	Messages []chatMessage `json:"messages"`
-	Yolo     *bool         `json:"yolo,omitempty"`
 }
 
 const sessionMaxAge = 7 * 24 * time.Hour
@@ -47,26 +46,26 @@ func sessionPath() (string, error) {
 // loadSession возвращает историю текущего терминала. Про любую проблему
 // сообщает вслух: раньше повреждённый файл молча давал пустую историю, и
 // пользователь не понимал, почему модель забыла контекст.
-func loadSession(profile string) ([]chatMessage, *bool) {
+func loadSession(profile string) []chatMessage {
 	path, err := sessionPath()
 	if err != nil {
 		warn(M.SessPathFail, err)
-		return nil, nil
+		return nil
 	}
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		info(M.SessFresh)
-		return nil, nil
+		return nil
 	}
 	if err != nil {
 		warn(M.SessReadFail, path, err)
-		return nil, nil
+		return nil
 	}
 
 	var sf sessionFile
 	if err := json.Unmarshal(data, &sf); err != nil {
 		warn(M.SessCorrupt, path, err)
-		return nil, nil
+		return nil
 	}
 
 	// В истории могут лежать tool_calls и role:"tool". Если новый профиль
@@ -75,14 +74,14 @@ func loadSession(profile string) ([]chatMessage, *bool) {
 	if sf.Profile != "" && sf.Profile != profile {
 		info(M.SessSwitch,
 			sf.Profile, profile)
-		return nil, nil
+		return nil
 	}
 
 	detail(M.SessDetail, len(sf.Messages), sf.Updated.Format("15:04:05"))
-	return sf.Messages, sf.Yolo
+	return sf.Messages
 }
 
-func saveSession(profile string, messages []chatMessage, yolo *bool) error {
+func saveSession(profile string, messages []chatMessage) error {
 	dir, err := sessionsDir()
 	if err != nil {
 		return err
@@ -98,12 +97,11 @@ func saveSession(profile string, messages []chatMessage, yolo *bool) error {
 		Profile:  profile,
 		Updated:  time.Now(),
 		Messages: messages,
-		Yolo:     yolo,
 	}, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0600)
+	return writeFileAtomic(path, data, 0600)
 }
 
 // gcSessions подчищает файлы мёртвых терминалов: процесс-родитель уже не
@@ -195,16 +193,8 @@ func sessionShow() int {
 		return exitOK
 	}
 
-	yoloStr := ""
-	if sf.Yolo != nil {
-		if *sf.Yolo {
-			yoloStr = ", yolo: on"
-		} else {
-			yoloStr = ", yolo: off"
-		}
-	}
 	fmt.Printf(M.SessHeader,
-		valueOr(sf.Profile, "?"), len(sf.Messages), sf.Updated.Format("2006-01-02 15:04:05"), yoloStr)
+		valueOr(sf.Profile, "?"), len(sf.Messages), sf.Updated.Format("2006-01-02 15:04:05"))
 
 	toolCallNames := make(map[string]string)
 	for _, m := range sf.Messages {

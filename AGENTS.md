@@ -6,7 +6,7 @@
 
 ## What is clank
 
-A minimal CLI that wraps any OpenAI-compatible API. Core use case: pipe terminal output into it, ask a question, get an answer — without opening a browser. Secondary use case: let the model run real shell commands and ask interactive questions via registered tools (`run_shell_command`, `question`, `view_image`).
+A minimal CLI that wraps any OpenAI-compatible API. Core use case: pipe terminal output into it, ask a question, get an answer — without opening a browser. Secondary use case: let the model look at files, edit them, run shell commands and ask interactive questions via registered tools.
 
 No dependencies outside the Go stdlib. Single binary. Config in `~/.config/clank/`.
 
@@ -20,9 +20,11 @@ make install  # → /usr/local/bin/clank (PREFIX overridable)
 make check    # fmt + vet + test
 ```
 
-Version is injected at link time from `date +%Y.%m.%d`. VCS is Fossil, not git — don't add git-based versioning.
+Version is injected at link time: `git describe --tags`, falling back to `date +%Y.%m.%d`. Releases are cut by `make publish|minor|major` (git tag → GitHub Actions).
 
-Module: `clank` (go 1.22.2, zero external deps).
+Module: `clank` (go 1.26, zero external deps). 1.26 is the floor because of `os.Root` (1.24) with its 1.25 additions (`MkdirAll`, `ReadFile`, `WriteFile`); 1.27 would drop macOS 12. All builds are `CGO_ENABLED=0` (static, no glibc dependency).
+
+`test/` is gitignored scratch space with its own `go.mod`, so `go test ./...` and `go vet ./...` do not descend into it.
 
 ---
 
@@ -33,28 +35,27 @@ All code is in package `main` (single package, flat directory). No subdirectorie
 | File            | Responsibility                                              |
 |-----------------|-------------------------------------------------------------|
 | `main.go`       | Entry point, top-level command dispatch                     |
-| `ask.go`        | Core ask loop, tool-call orchestration                      |
-| `client.go`     | HTTP client, OpenAI-compatible API types, retry/fallback    |
-| `config.go`     | Config file load/save, profile management, allowed-commands |
-| `configcmd.go`  | `clank config *` and `clank models` subcommands             |
-| `completion.go` | `clank completion` scripts (zsh/bash/fish RU+EN), install/remove |
-| `completion_test.go` | sync test: scripts cover all commands/flags            |
-| `lang.go`       | Language tables switch, locale detect, `clank language`     |
+| `ask.go`        | Core ask loop: flags, chain, sticky fallback, tool loop     |
+| `tools.go`      | Tool schemas, path policy (`os.Root`), tool execution       |
+| `client.go`     | HTTP client, SSE streaming, error classification, fallback  |
+| `config.go`     | Config types, legacy migration, atomic save, `updateConfig` |
+| `configcmd.go`  | `clank config *`, `clank config model *`, `clank models`, `clank mode` |
+| `completion.go` | `clank completion` scripts (zsh/bash/fish, RU+EN from one template) |
+| `lang.go`       | Language tables switch, locale detect, `clank lang`, help topics |
 | `lang_ru.go`    | Russian UI strings (`RU` table)                             |
 | `lang_en.go`    | English UI strings (`EN` table)                             |
-| `exec.go`       | Shell execution, output capping, command vetting            |
+| `exec.go`       | Shell execution, output capping                             |
 | `exec_*.go`     | Platform-specific shell execution (Unix/Windows)            |
 | `lifecycle.go`  | `purge`, `uninstall`, and `nuke` commands                   |
 | `session.go`    | Per-TTY session persistence, GC                             |
 | `session_*.go`  | Platform-specific session identity (Unix/Windows)           |
-| `systemprompt.go` | Builds the system prompt dynamically                      |
+| `systemprompt.go` | Builds the system prompt per model and mode               |
 | `systemprompt_*.go` | Platform-specific shell detection (Unix/Windows)        |
-| `term.go`       | Terminal column layout                                      |
-| `term_*.go`     | Platform-specific terminal width (Unix/Windows)             |
 | `tty.go`        | All interactive I/O (single reader), prompts                |
 | `tty_*.go`      | Platform-specific TTY handle (Unix/Windows)                 |
 | `ui.go`         | Logging levels, spinner, exit codes, string helpers         |
 | `update.go`     | Self-update via GitHub Releases with caching                |
+| `*_test.go`     | `config_test.go` (migration, flags, stream, lang tables), `tools_test.go` (path policy, tools), `completion_test.go`, `update_test.go` |
 
 ---
 
@@ -62,16 +63,16 @@ All code is in package `main` (single package, flat directory). No subdirectorie
 
 ```
 os.Args[1] → switch:
-  "ask"     → cmdAsk(rest)
-  "models"  → cmdModels(rest)
-  "config"  → cmdConfig(rest)
-  "session" → cmdSession(rest)
-  "yolo"    → cmdYolo(rest)
-  "completion" → cmdCompletion(rest)  // print script, install
-  "language"→ cmdLanguage(rest)
+  "ask"        → cmdAsk(rest)
+  "models"     → cmdModels(rest)        // provider model list, a hint for `config model add`
+  "config"     → cmdConfig(rest)
+  "session"    → cmdSession(rest)
+  "mode"       → cmdMode(rest)          // ask | read | auto
+  "completion" → cmdCompletion(rest)
+  "lang", "language" → cmdLanguage(rest)
   "update" / "purge" / "uninstall" / "nuke" → lifecycle
-  "version" → print version
-  default   → cmdAsk(os.Args[1:])   ← the common path
+  "version"    → print version
+  default      → cmdAsk(os.Args[1:])   ← the common path
 ```
 
 The `default` branch means `clank "why is grub broken"` works without the `ask` subword. Conflict only when the question's first word is itself a subcommand name — for that, `clank ask ...` exists.
@@ -88,134 +89,161 @@ The `default` branch means `clank "why is grub broken"` works without the `ask` 
 
 ---
 
+## Config CLI (`configcmd.go`)
+
+No interactive wizard — everything is flags, so it works without a TTY.
+
+```
+clank config create <name> --api-url <url> [--api-key] [--proxy] [--reasoning-default] [--exec-timeout]
+                    [--model <id> [--name] [--reasoning] [--tools] [--vision] [--context]]...
+clank config edit   [-p name] [--rename] [--api-url] [--api-key] [--proxy] [--reasoning-default] [--exec-timeout]
+clank config list | show [name] | use <name> | rm <name> [-y]
+clank config model list|add|edit|rm|activate|move|enable|disable <id|N> [-p name] [flags]
+clank models [-p name] [--all] [filter]
+clank mode [show|ask|read|auto]
+```
+
+- `scanFlags` keeps flag **order**: in `create`, model flags apply to the last `--model`; a model flag before any `--model` is an error. Profile-level reasoning is `--reasoning-default`, so there is no ambiguity with the per-model `--reasoning`.
+- `"-"` resets a field (`--proxy -`, `--api-key -`, `--reasoning -`, `--name -`).
+- `<id|N>`: exact id match wins, otherwise a 1-based number from `config model list` (`Profile.findModel`).
+- `--context` takes tokens with optional `k`/`m` (`128k` = 131072).
+- Booleans are strict (`parseBool`): a typo is an error, not `false`.
+- `--reasoning` takes a concrete level or `off`; `on`/`true` are rejected. `none` is normalized to `off`.
+- `rm` asks `[y/N]` on the TTY; without a TTY it requires `-y`.
+- Every mutation goes through `updateConfig` (see Config).
+- `clank models` hides non-text models (embeddings, speech, image output) when the provider returns OpenRouter-style metadata, and prints `tools`/`vision`/`reasoning:<efforts>` tags from it. Nothing is cached and nothing is written to the config — capabilities are set by hand.
+
+---
+
 ## The ask loop (`ask.go`)
 
-### `cmdAsk(args []string) int`
+### Flags (parsed manually, value flags accept `--x v` and `--x=v`)
 
-Flags parsed manually (no `flag` package):
-- `-c / --context` — force-read stdin even if it's a TTY
-- `-r / --resume` — load previous session for this terminal
-- `-v / --verbose` — set `verboseLevel = vVerbose`
-- `-q / --quiet` — set `verboseLevel = vQuiet`
-- `--` — everything after is question text (escape hatch for args starting with `-`)
+- `-c/--context`, `-r/--resume`, `-v/--verbose`, `-q/--quiet`, `-i/--image <file>` (repeatable), `--`
+- `-p/--profile <name>` — profile for this run
+- `-m/--model <id|N>` — that model goes first (even if disabled), the rest of the enabled chain stays as fallback
+- `--mode ask|read|auto` — permission mode for this run
+- `--reasoning <level|off>` — overrides model and profile reasoning for this run
 
-**Flow:**
+**Nothing set by flags is persisted** — not in the config, not in the session.
+
+### Flow
 
 ```
 1. Parse flags
-2. Load config + active profile, validate
-3. gcSessions() — clean up dead terminal sessions
-4. Read stdin if -c or stdin is not a TTY
-5. Build userContent = question [+ context block if stdin present]
-6. Load session history if --resume
-7. Assemble messages = [system] + [history] + [user]
-8. Enter tool loop:
-     a. chatWithFallback() → chatResult
-     b. Append assistant message to messages + turnMessages
-     c. If no tool_calls → break (final answer)
-     d. For each tool_call → runToolCall()
-        - verdictInterrupted → break loop
-     e. Append tool result message → continue
-9. Print final answer to stdout
-10. saveSession() on all exits (including error paths via finish())
+2. Load config, resolve profile (-p or active), validate (api-url + ≥1 enabled model)
+3. Build chain = enabled models in order (with -m moved to front)
+4. gcSessions(); read stdin if -c or stdin is not a TTY
+5. convo = [history (if -r)] + [user]   ← never contains the system message
+6. Tool loop:
+     a. chatWithFallback(profile, chain, build) → (result, idx)
+        build(model) prepends a system prompt built for THAT model's
+        tools/vision and the mode, and picks its tools and reasoning
+     b. chain = rotateChain(chain, idx)   ← sticky fallback
+     c. no tool_calls → final answer
+     d. each tool_call → runToolCall(env, tc); on interrupt the remaining
+        tool_calls get a "not run" tool message so history stays valid
+7. Print final answer; saveSession() on all exits via finish()
 ```
 
-**`turnMessages`** is what gets saved to disk: it starts from history (if resume), appends everything that happened this turn, but **never** includes the system message — the system prompt is rebuilt fresh every run (cwd and date change).
+**Sticky fallback**: when a fallback model answered, the chain is rotated so it is tried first on the next step, and the models before it go to the end. Not remembered between runs.
 
-**`messages`** is what gets sent to the API: it includes the system message prepended, because the API requires it.
+---
 
-### `runToolCall(cf *ConfigFile, p Profile, tc toolCall, yolo bool) (chatMessage, toolVerdict)`
+## Tools (`tools.go`)
 
-Validates and routes the tool call:
+| Tool | Kind | Notes |
+|---|---|---|
+| `list_dir(path, recursive, pattern)` | read | dirs end with `/`; `pattern` is a glob on names (recursive+pattern = find); cap 1000 entries |
+| `read_file(path, offset, limit)` | read | numbered lines, default/max 2000 lines, 256 KB, binary refused |
+| `grep(pattern, path, glob, ignore_case)` | read | RE2; `file:line:text`; cap 500 matches; skips binary and >10 MB files |
+| `view_image(path)` | read | only when the model has `vision`; image goes as a follow-up user message |
+| `write_file(path, content)` | write | creates parents; keeps the mode of an existing file |
+| `edit_file(path, old_string, new_string, replace_all)` | write | exact match; 0 or >1 matches (without replace_all) is an error before any prompt |
+| `run_shell_command(command)` | write | `sh -c`, see Shell execution |
+| `question(question, options, default)` | — | asks the user on the TTY |
 
-#### 1. `run_shell_command`
-1. JSON-unmarshal `tc.Function.Arguments` → `{command: string}`
-2. Reject empty command
-3. Check if command is in `cf.Allowed` AND `isSimpleCommand()` (or if YOLO mode is active) → auto-execute
-4. Otherwise call `confirmCommand()` → `ansYes / ansNo / ansAlways`
-   - `ansAlways` → `cf.allow(name, level)` + `saveConfigFile()`
-   - `ansNo` → return `verdictDeclined`
-5. `execShell()` → `execResult`
-6. Return tool message with stdout/stderr/exit code
+Schemas and tool results to the model are **English and never localized**. Caps protect the context; there is no hardcoded skip list (`.git`, `node_modules`) — the model narrows the path itself.
 
-#### 2. `question`
-1. JSON-unmarshal `tc.Function.Arguments` → `{question: string, options: []string, default: string}`
-2. Call `promptQuestion(qText, options, default)` to interactively ask the user on `/dev/tty`
-3. Return the selected/custom option or default, with `verdictOK` (or `verdictInterrupted` on Ctrl-C/EOF)
+`toolsFor(model, mode)`: a model with `tools=false` gets nothing; `read` mode does not send write tools or the shell at all; `view_image` only with `vision`. If a model calls a write tool in `read` mode anyway, it gets an error.
 
-#### 3. `view_image`
-1. JSON-unmarshal `tc.Function.Arguments` → `{path: string}`
-2. Print `· смотрю <path>` to stderr
-3. Read file, encode to base64 data URI
-4. Return `toolMsg` confirming load and a follow-up `userMsg` containing the `image_url` payload for the model to see
+### Path policy
 
-**Verdicts:**
+`resolvePath`: `~` expansion → `Abs` → `Clean` → `EvalSymlinks` (for a non-existent path the nearest existing ancestor is resolved, the rest appended — it contains no `..` after Clean and cannot hold symlinks). Then:
 
-| Constant            | Meaning                                     |
-|---------------------|---------------------------------------------|
-| `verdictOK`         | executed, continue loop                     |
-| `verdictInvalid`    | bad tool request, model gets error message  |
-| `verdictDeclined`   | user said no, tool refusal message sent to model, continue loop |
-| `verdictInterrupted`| Ctrl-C during execution, break loop         |
+- `inside` = `within(cwdReal, real)`, compared via `filepath.Rel`, **not** `HasPrefix` (`/a/proj-evil` is not inside `/a/proj`).
+- `sensitive` = inside `~/.ssh`, `~/.gnupg` or the clank config dir.
+
+| | inside cwd | outside cwd | sensitive |
+|---|---|---|---|
+| read, mode ask/read | auto | confirm | confirm |
+| read, mode auto | auto | auto | confirm |
+| write, mode ask | confirm | confirm | confirm |
+| write, mode auto | auto | auto | confirm |
+
+Operations run through `os.Root` (`openAt`): inside cwd the root is cwd itself, so neither `..` nor a symlink swapped after the check can escape; outside cwd (after confirmation) the root is the nearest existing ancestor of the target.
+
+Declines go to the model as `NOT DONE: the user declined…` — the blunt wording is deliberate, small models otherwise report success.
 
 ---
 
 ## API client (`client.go`)
 
-### Key types
+### Streaming and timeouts
 
-```go
-chatMessage  {Role, Content, ToolCalls, ToolCallID}
-toolCall     {ID, Type, Function{Name, Arguments}}
-toolDef      {Type, Function{Name, Description, Parameters}}
-chatRequest  {Model, Messages, Stream=false, Tools}
-chatResponse {Choices[]{Message{Role, Content, ToolCalls, ReasoningContent}, FinishReason}, Error}
-chatResult   {msg chatMessage, model string, finishReason string}
-```
+Requests are `stream: true`; the SSE stream is accumulated into one message and printed whole, as before. Timeouts measure **silence**, not total length:
 
-`Content` has `omitempty` because some strict servers reject an empty string where they expect `null` on assistant messages that only have `tool_calls`.
+| Constant | Value | What |
+|---|---|---|
+| `dialTimeout` | 10s | TCP connect, TLS handshake |
+| `firstEventTimeout` | 90s | from request to the first stream line (queue + time to first token) |
+| `idleEventTimeout` | 30s | between stream lines |
+
+Any line resets the timer, including keep-alive comments (`: PROCESSING`) and `reasoning_content` deltas. There is no overall `http.Client.Timeout`. A server that ignores `stream:true` and returns `application/json` is parsed as a whole response. `streamAcc` assembles `tool_calls` deltas by `index` (a new `id` at the same index means a new call), and `stripThinkBlocks` runs on the final text.
+
+`http.Client` is cached per proxy value, so the tool loop reuses connections. `Authorization` is only sent when `api_key` is set (local servers).
 
 ### Call stack
 
 ```
 cmdAsk
-  └─ chatWithFallback(profile, messages, useTools)
-       └─ for each model in profile.Models:
-            chatCompleteRetry(profile, model, messages, useTools)
-              └─ [up to maxRetries=3 with exponential backoff]
-                   chatComplete(profile, model, messages, useTools)
-                     └─ apiRequest(profile, "POST", "/v1/chat/completions", body, model)
-                          └─ httpClient(profile) → http.Client [proxy aware]
+  └─ chatWithFallback(profile, chain, build)        → (result, index in chain)
+       └─ for each model: chatCompleteRetry(...)    ← up to maxRetries=3, backoff 1s, 2s
+            └─ chatComplete(profile, model, msgs, reqOpts{tools, reasoning})
+                 └─ doStream() → POST /v1/chat/completions (SSE)
 ```
 
-### Fallback logic
+### Error classification (`classify`) and fallback
 
-`chatWithFallback` walks `profile.Models` in order. A model is retried (same model) for:
-- `errTransport` (network)
-- `errRateLimit` (429)
-- `errServer` (5xx)
+| Kind | Source | Attempts on the same model | Then |
+|---|---|---|---|
+| `errConnect` | DNS, connection refused, TLS — before any response | 2 | **stop**: the host is shared by all models of the profile |
+| `errTransport` | connection broke mid-response | 3 | next model |
+| `errTimeout` | silence past the timeouts | 1 | next model |
+| `errServer` | 500, empty stream / 408, 502, 503, 504, 529 | 2 / 3 | next model |
+| `errRateLimit` | 429 | 2 | next model |
+| `errQuota` | 402, or 429 with quota/billing/credit in the body | 1 | next model |
+| `errForbidden` | 403 (routers: model not allowed for this key) | 1 | next model |
+| `errModelMissing` | body text | 1 | next model |
+| `errContextOverflow` | body text | 1 | only models with a **bigger** `context`; current `context` unknown → stop with a hint |
+| `errNoImages` | 400 + "image" + "not support/accept…" | — | strip images, retry the same model, print `ImagesDropped` once |
+| `errBadEffort` | 400 + "reasoning/effort" + "invalid/must be one of…" | — | drop `reasoning_effort`, retry the same model, `warn` |
+| `errNoTools` | 400 + "tool" + "not support…" | 1 | `ask.go` marks `tools=false` in the config, offers another tool model on the TTY, otherwise stops |
+| `errTooLarge` | 413 | 1 | stop (proxy limit) |
+| `errAuth`, `errBadRequest`, `errNotFound`, `errConfig` | | 1 | stop |
 
-A model triggers advancement to the next model for the above **plus** `errModelMissing` (model doesn't exist at provider).
+`Retry-After` (seconds or HTTP date) is honoured, but longer than `maxRetryWait` (10 s) means "next model" instead of waiting. Backoff otherwise: 1 s, 2 s. Body substrings are imprecise by nature — extend the lists in `classify` when a provider phrases it differently. Errors that arrive inside the stream (`data: {"error":…}`) are classified the same way.
 
-Auth errors (`errAuth`), context overflow (`errContextOverflow`), and bad requests (`errBadRequest`) **do not** trigger fallback — they'll fail on any model in the same profile.
+`finish_reason`: `length` → `warn` (answer cut), `content_filter` → `warn`; neither triggers the fallback.
 
-### Error classification (`classify`)
+### Images and tool history
 
-`classify(statusCode int, bodyText string) errKind` — matches HTTP status + body text patterns against known error kinds. Body-text matching is needed because providers use status 400 for wildly different things.
+- A model with `vision=false` gets a copy of the dialogue with images removed (`stripImages`; `-i`, `view_image` follow-ups and `-r` history alike), and the user sees `Изображения не поддерживаются моделью, ответ генерируется без учёта изображения` once per run. The dialogue itself keeps the images for vision models.
+- Once the dialogue contains `tool_calls` or `role:"tool"` (this run or from `-r`), models with `tools=false` leave the chain. No tool model left → stop.
 
-### Reasoning model support
+### Reasoning
 
-Reasoning blocks (`<think>`, `<thought>`, `<reasoning>`, and `reasoning_content`) are stripped and never exposed to the user.
-Reasoning can be toggled via `clank config set-reasoning on|off` or `--reasoning=on|off`.
-`clank config test-reasoning` auto-detects and calibrates model parameters (`max` → `ultra` → `xhigh` → `high` for ON; `none` → `minimal` → `low` for OFF; or token budgets).
-
-### Tool definition
-
-Three tools are registered: `run_shell_command`, `question`, and `view_image`.
-Their JSON schemas are hardcoded **in English and never localized** — small
-models parse EN schemas more reliably, and EN schema + RU prompt is fine.
-`view_image` is dropped from the request when `profile.Vision == false`
-(see `requestTools`). The system prompt instructs the model on policy.
+`reqOpts.reasoning`: `""` → the parameter is not sent; `"off"` → `reasoning_effort: "none"`; anything else is sent as-is. Effective value: `--reasoning` flag → `model.reasoning` → `profile.reasoning_default`. Reasoning text is never shown (`reasoning_content` isn't collected; `<think>/<thought>/<reasoning>` tags are stripped).
 
 ---
 
@@ -225,45 +253,58 @@ models parse EN schemas more reliably, and EN schema + RU prompt is fine.
 
 `~/.config/clank/config.json` (hardcoded — intentionally consistent across macOS and Linux, avoids `~/Library/Application Support` on macOS).
 
-### `ConfigFile` structure
+### Structure
 
 ```go
 ConfigFile {
-    Active   string                // name of currently active profile
-    Profiles map[string]Profile
-    Allowed  map[string]TrustLevel // command names with trust levels ("simple" or "all")
-    Yolo     bool                  // global YOLO mode (bypass all prompts)
-    Language string                // "ru", "en", "" = auto-detect (clank language)
+    Active      string             // active profile name
+    Profiles    map[string]Profile
+    Mode        ToolMode           // "ask" | "read" | "auto"; "" = ask. Global, not per profile.
+    Language    string             // "ru", "en", "" = auto-detect
+    Completions []string           // completion scripts we installed
 }
-```
 
-### `Profile` structure
-
-```go
 Profile {
-    BaseURL        string    // without trailing /v1 — normalizeBaseURL() strips it
-    APIKey         string    // stored plaintext, file is 0600
-    Models         []string  // fallback chain; [0] is primary
-    Model          string    // legacy compat mirror of Models[0]
-    Proxy          string    // explicit proxy; empty = use HTTP_PROXY/HTTPS_PROXY env
-    UseTools       bool      // whether to include tool definition in API requests
-    Vision         *bool     // nil = untested (assume yes); set by `clank config test-vision`
-    ExecTimeoutSec int       // 0 = defaultExecTimeout (10 min)
-    Created        string    // RFC3339, used for auto-selection when Active is stale
+    BaseURL          string        // without trailing /v1 — normalizeBaseURL() strips it
+    APIKey           string        // optional, plaintext, file is 0600
+    Proxy            string        // "" = HTTP_PROXY/HTTPS_PROXY env
+    Models           []ModelEntry  // order = fallback order; first enabled = active
+    ReasoningDefault string        // for models without their own reasoning
+    ExecTimeoutSec   int           // 0 = defaultExecTimeout (10 min)
+    Created          string        // RFC3339, used for auto-selection when Active is stale
+}
+
+ModelEntry {
+    ID        string
+    Name      string   // display only
+    Tools     bool
+    Vision    bool
+    Reasoning string   // level | "off" | "" = profile default
+    Context   int      // context size in tokens, 0 = unknown; used on context overflow
+    Disabled  bool     // kept in place, skipped by the fallback
 }
 ```
 
-### `normalizeBaseURL`
+Capabilities live on the **model**: in a fallback chain neighbouring models often differ, and a per-profile `use_tools` used to break a fallback model without tool support with a 400.
 
-Strips trailing `/v1` (and any repetitions of it). The client always appends `/v1/chat/completions` or `/v1/models` itself. Without this, configs copied from provider docs (which include `/v1`) would produce `/v1/v1/...`.
+### Saving
 
-### `activeProfile`
+- `saveConfigFile` is atomic: temp file in the same dir → `fsync` → `rename`.
+- `updateConfig(fn)` re-reads the file, applies `fn`, saves. **All mutations go through it**, so a stale in-memory snapshot (e.g. a long `clank` run in another tab) never reverts someone else's change.
 
-If `cf.Active` is set and exists → return it. If not (deleted profile, empty config), auto-selects by `newestProfileName` (most recent `Created` timestamp, ties broken alphabetically), saves the selection, and logs a notice. Prevents the "no active profile" error after `config rm`.
+### Migration from the old format
 
-### Allowed commands
+`Profile.UnmarshalJSON` / `ConfigFile.UnmarshalJSON` accept the old shape (`models: ["a","b"]`, `model`, profile-level `use_tools`/`vision`/`reasoning`/`reasoning_effort`, top-level `yolo`/`allowed_commands`):
 
-`cf.Allowed` is a sorted list of command names (first word only). When the model requests a command whose name is in this list **and** the command passes `isSimpleCommand()`, it runs without prompting. Managed via `clank config allow-rm` / `allow-clear`.
+- per-profile `use_tools`/`vision` are copied onto every model (`vision: null` meant "assume yes" → `true`);
+- `reasoning: false` → `reasoning_default: "off"`; `true` + effort → that effort; `true` alone → `"max"` (what the old version sent);
+- `yolo: true` → `mode: "auto"`; `allowed_commands` is dropped.
+
+Loading never writes (it runs from `initLang` on every start). `isLegacyConfig` remembers the raw bytes, and the first save writes them to `config.json.bak` (only if no `.bak` exists yet).
+
+### `activeProfile` / `resolveProfile`
+
+If `cf.Active` points nowhere, `activeProfile` auto-selects `newestProfileName` (latest `Created`, ties alphabetical), saves via `updateConfig`, and logs a notice. `resolveProfile(cf, name)` is `-p` or the active one.
 
 ---
 
@@ -278,17 +319,11 @@ If `cf.Active` is set and exists → return it. If not (deleted profile, empty c
 - Timeout: `SIGTERM` first, then `SIGKILL` after 5s
 - Returns `execResult{output, exitCode, interrupted, timedOut}`
 
+Whether a command may run is decided only by the mode (`ask` → confirm every command, `auto` → run, `read` → shell is not offered). There is no command allow-list any more.
+
 ### `cappedWriter`
 
 Caps output at `maxToolOutputBytes = 10MB`. Keeps **head** and **tail** (each `limit/2`), drops the middle with a note. Cuts on UTF-8 rune boundaries so the model doesn't see partial Cyrillic characters. `Write` always reports success to avoid breaking `io.MultiWriter`.
-
-### `isSimpleCommand(command string) bool`
-
-Heuristic, not a shell parser. Returns false if command contains any of: `; & | < > \n \r ( ) { }` or `$( ${ `` $((`. Commands that pass are safe to auto-execute by name — complex ones require manual confirmation even if the name is in the allowed list.
-
-### `commandName(command string) string`
-
-Returns the binary name from the first non-assignment token, stripping leading path components. `FOO=bar /usr/bin/ls -la` → `ls`.
 
 ---
 
@@ -300,88 +335,56 @@ Sessions are per-TTY, not per-user. ID is `<tty_rdev_hex>-<ppid>`:
 - `rdev` of `/dev/tty` — identifies the terminal device
 - `ppid` — the shell PID of the terminal tab
 
-This distinguishes multiple tabs sharing the same tty device (different ppid) and survives terminal device name reuse after close (different rdev after reopen).
-
 Headless environments (no `/dev/tty`) use the fixed ID `"headless"`.
 
 ### Storage
 
-`~/.config/clank/sessions/<id>.json`
+`~/.config/clank/sessions/<id>.json`, written atomically, `0600`.
 
 ```go
 sessionFile {
     Profile  string
     Updated  time.Time
     Messages []chatMessage  // no system message; rebuilt fresh each run
-    Yolo     *bool          // session YOLO mode
 }
 ```
 
-File permissions: `0600`.
+The mode is **not** stored in the session: `--mode` applies to one run only (the old `--yolo` leaked into `-r` this way).
 
-### `loadSession(profile string) []chatMessage`
-
-- Profile mismatch check: if session was written by a different profile, discards it. Reason: session may contain `role:"tool"` messages; a profile without `use_tools` will get HTTP 400 on those.
-- Logs verbose detail on what it loaded, warns loudly on corruption.
-
-### `saveSession`
-
-Called via `finish()` closure in `cmdAsk` — runs **on all exit paths** including API errors. A session interrupted halfway still records what happened, so `-r` can resume from the actual state.
-
-### `gcSessions`
-
-Runs at the start of every `cmdAsk`. Removes session files older than `sessionMaxAge = 7 days` where the parent shell process (from the filename's pid component) is no longer alive (`kill(pid, 0)` returns ESRCH).
+- `loadSession(profile)` discards a session written by another profile (it may contain `role:"tool"` messages) with a notice. Don't suppress that notice.
+- `saveSession` is called via `finish()` in `cmdAsk` on **all** exit paths, including API errors.
+- `gcSessions` removes files older than 7 days whose parent shell is dead.
 
 ---
 
 ## System prompt (`systemprompt.go`)
 
-### `buildSystemPrompt(useTools bool, vision bool) string`
+### `buildSystemPrompt(useTools, vision bool, mode ToolMode) string`
 
-Rebuilt every invocation, composed from capability blocks — no conditionals
-in the text itself. `vision` is `profile.Vision != false` (nil = untested,
-assume yes). Follows the UI language (RU/EN tables), so the model replies
-in the user's language. Contains:
-- Role: terminal assistant (answers, error triage, task execution)
-- Answer rules: short, user's language, explicit "no markdown" instruction
-  (no `**`, `###`, triple backticks, bullet `*`)
-- Current working directory, hostname, date, detected shell, OS/arch
-- Session-history note (`-r` continuation is part of the same session)
-- If tools: work policy (act via tools, self-serve missing data via
-  `run_shell_command`, `question` only for real forks, never announce calls,
-  destructive only on explicit request or via `question` with consequences).
-  The `view_image` paragraph only when `vision` is true.
-- If no tools: "suggest a one-liner pipe to clank -r"
+Built for **each model attempt** (the fallback may land on a model without tools or vision — then the prompt stops promising them). Follows the UI language. Contains:
+- Role, answer rules, explicit "no markdown" instruction
+- cwd, hostname, date, detected shell, OS/arch; session-history note
+- With tools: act via tools; look at files with `list_dir`/`read_file`/`grep`, not the shell (those need no confirmation); `question` only for real forks; never announce calls
+- `view_image` paragraph only with `vision`
+- `read` mode: no changes possible, suggest rerunning with `--mode ask`; otherwise: `edit_file`/`write_file` rules, shell for the rest, destructive only on request
+- Without tools: suggest a one-liner pipe to `clank -r`
 
-The tool list itself is NOT enumerated — schemas are already in the request
-(see below). The prompt carries policy (when/why), schemas carry mechanics.
-
-The no-markdown rule is critical: the terminal doesn't render markdown, it just prints the asterisks.
+The tool list itself is NOT enumerated — schemas are in the request. The prompt carries policy, schemas carry mechanics.
 
 ### `detectShell`
 
-Uses `ps -p <ppid>` to find the actual current shell, not `$SHELL` (which reflects the login shell, not the currently running one). Works on both Linux and macOS without `/proc`.
+Uses `ps -p <ppid>` to find the actual current shell, not `$SHELL`. Login shells (`-zsh`) are normalized.
 
 ---
 
 ## Localization (`lang.go`, `lang_ru.go`, `lang_en.go`)
 
-All user-visible strings live in `Msgs` tables (`RU`, `EN`); code uses `M.Field`.
-New language = new `lang_xx.go` table + one branch in `applyLang` — the compiler
-flags missing fields. Tool JSON schemas stay English (see above).
+All user-visible strings live in `Msgs` tables (`RU`, `EN`); code uses `M.Field`. New language = new `lang_xx.go` table + one branch in `applyLang`. `TestLangTablesComplete` fails on an empty field or on format verbs that differ between languages. Tool schemas and tool results stay English.
 
-- `initLang()` runs first in `main()`: explicit `ConfigFile.Language` wins,
-  otherwise `detectLang()` reads `LC_ALL` → `LC_MESSAGES` → `LANG`
-  (first non-empty decides; `ru*` → RU, anything else incl. C/POSIX → EN).
-- `clank language [en|ru|auto]` shows or sets the override.
-- `clank help [cmd [sub]]` routes to per-topic help (nested supported).
-- `config show` prints the language line; `config test-vision` saves `Vision`.
-- `config test-model` runs tools+reasoning+vision probes with one save.
-- `clank completion install` records paths in `ConfigFile.Completions`;
-  `uninstall`/`nuke` remove them. Shell scripts are hand-written —
-  `completion_test.go` fails if a command/flag is missing from any script.
-  zsh/fish scripts ship RU+EN variants picked by UI language; `clank
-  language` reinstalls recorded scripts automatically.
+- `initLang()` runs first in `main()`: explicit `ConfigFile.Language` wins, otherwise `LC_ALL` → `LC_MESSAGES` → `LANG` (`ru*` → RU, anything else → EN).
+- `clank lang [en|ru|auto]` (alias `language`) shows or sets the override and reinstalls recorded completion scripts.
+- `clank help [cmd [sub]]` routes to per-topic help (`help config create`, `help config model`).
+- Completion scripts are generated from one template per shell (`zshScript`, `fishScript`, `bashScript`) and a description table per language (`compEN`, `compRU`). `completion_test.go` checks that every `case "…":` in `main.go` and `configcmd.go` and every ask flag appears in every script.
 
 ---
 
@@ -406,32 +409,16 @@ flags missing fields. Tool JSON schemas stay English (see above).
 
 stdin is deliberately **not** used for prompts — it may be carrying a context pipe.
 
-### Functions
-
 | Function                                   | Purpose                                          |
 |--------------------------------------------|--------------------------------------------------|
 | `ttyIO() (*os.File, *bufio.Reader, error)` | Open/return the single tty handle                |
 | `haveTTY() bool`                           | Whether we have a terminal at all                |
 | `askLine(prompt) (string, bool)`           | Read one line from tty; ok=false on EOF/no-tty   |
-| `askLineDefault(label, current, display)`  | Like askLine but returns current on empty input  |
 | `confirmYN(prompt, defaultYes) bool`       | Y/N prompt with re-ask on garbage input          |
-| `confirmCommand(cmdStr, name, known) answer` | Show command, ask y/N/a                        |
+| `confirmTool(title, body) bool`            | Show what the model wants, ask y/N; no TTY / EOF / empty = no |
+| `promptQuestion(q, options, default)`      | The `question` tool                              |
 
-`confirmYN` loops on unrecognized input instead of treating it as "no" (prevents typos silently declining).
-
-`confirmCommand` writes both the command text and the prompt to the **same fd** (`/dev/tty`). Previously they went to different fds; with `2>log` the user would see "execute?" with no command text.
-
----
-
-## Terminal utilities (`term.go`)
-
-### `termWidth() int`
-
-Order: ioctl on stdout → ioctl on stderr → ioctl on /dev/tty → `$COLUMNS` env → 80.
-
-### `layoutColumns(cells []string, width int) []string`
-
-Column-major layout (like `ls`): numbers read top-to-bottom within each column. Used for model selection display. Pads with spaces, trims trailing spaces per line.
+`confirmYN` loops on unrecognized input instead of treating it as "no". `confirmTool` writes the action and the prompt to the **same fd** (`/dev/tty`); with `2>log` the user still sees what they confirm.
 
 ---
 
@@ -441,74 +428,36 @@ All diagnostic output → **stderr**. All model output and command stdout → **
 
 | Function         | Level condition     | Prefix   | Notes                              |
 |------------------|---------------------|----------|------------------------------------|
-| `detail()`       | `vVerbose` only     | `  · `   | API timing, message counts         |
-| `info()`         | `vNormal` and above | none     | profile selection, spinner, etc.   |
+| `detail()`       | `vVerbose` only     | `  · `   | API timing, stream stats, counts   |
+| `info()`         | `vNormal` and above | none     | fallback switches, tool actions    |
 | `warn()`         | always              | `! `     | data loss risk, degraded operation |
-| `fail()`         | always              | `ошибка:` | fatal errors before exit          |
+| `fail()`         | always              | `ошибка:`/`error:` | fatal errors before exit |
 
 ### Spinner
 
-`startSpinner(msg) *spinner` — starts a goroutine writing animated `- \ | /` frames to stderr. Only runs when `verboseLevel != vQuiet` and stderr is a TTY. `stopSpinner()` closes the goroutine and clears the line with `\r\033[K`.
+`startSpinner(msg) *spinner` — animated frames on stderr, only when not quiet and stderr is a TTY. Nil-safe.
 
 ### `sanitizeForDisplay(s string)`
 
-Replaces control characters (except `\n` and `\t`) with `\xNN` / `\uNNNN` escape sequences. Prevents ANSI escape sequences or `\r` from overwriting already-printed text in the confirmation prompt — otherwise a model response like `"echo ok\r\033[2Krm -rf ~"` could display "rm -rf ~" in the confirmation while actually running "echo ok".
-
----
-
-## Data flow: full request lifecycle
-
-```
-User: clank -c -r "what's wrong with my nginx config"
-  │
-  ├─ stdin → readStdin() → context string
-  ├─ loadSession(profile) → []chatMessage (history)
-  ├─ buildSystemPrompt(useTools) → system message
-  │
-  ├─ messages = [system, ...history, user("Context:\n<stdin>\n\nQuestion: ...")]
-  │
-  └─ loop (i < 1000):
-       ├─ chatWithFallback()
-       │    ├─ chatCompleteRetry(model[0])  ← try up to 3× with backoff
-       │    │    └─ chatComplete()
-       │    │         └─ apiRequest() → POST /v1/chat/completions
-       │    └─ on failure → try model[1], model[2], ...
-       │
-       ├─ res.msg has ToolCalls? NO → print res.msg.Content → done
-       │
-       └─ YES → for each toolCall:
-                  ├─ validate tool name
-                  ├─ parse JSON args → cmdStr
-                  ├─ isSimpleCommand && isAllowed? → auto-run
-                  │   else confirmCommand() → y/N/a
-                  └─ execShell(cmdStr, timeout)
-                       ├─ stdout → user's stdout (live) + cappedWriter
-                       └─ return execResult → tool message → back to loop
-```
+Replaces control characters (except `\n` and `\t`) with `\xNN` / `\uNNNN` escapes. Prevents `\r`/ANSI sequences from overwriting the confirmation prompt — otherwise `"echo ok\r\033[2Krm -rf ~"` could display one thing and run another.
 
 ---
 
 ## Key invariants / design rules
 
 1. **No external deps.** Stdlib only. Don't add modules.
-
-2. **`content omitempty` on chatMessage.** Some servers reject `"content": ""` on assistant messages that have `tool_calls`. Do not change this.
-
-3. **System message excluded from saved session.** `turnMessages` never gets the system prompt. It's always rebuilt from current env at startup.
-
-4. **Save session on all exit paths.** The `finish()` closure in `cmdAsk` is called with `defer`-equivalent pattern at every `return`. Don't add bare `return exitFoo` without going through `finish()`.
-
-5. **Single tty reader.** Never open a second `bufio.Reader` on `/dev/tty`. All prompts must go through `ttyIO()`.
-
-6. **Child process in same process group.** `execShell` does NOT call `cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}`. This is intentional: sudo password prompts need tty access and would get SIGTTIN if backgrounded.
-
-7. **Fallback triggers only on technical failures.** "Model gave a bad answer" does not trigger model fallback. Only transport/rate/server/missing-model errors do.
-
-8. **`normalizeBaseURL` is idempotent.** Strips all trailing `/v1` suffixes in a loop. Safe to call multiple times.
-
-9. **All user-visible command text goes through `sanitizeForDisplay`.** Never print raw model output as a command without sanitizing.
-
-10. **`cappedWriter.Write` always returns `(n, nil)`.** Non-negotiable: returning an error from Write breaks `io.MultiWriter` and kills command output mid-run.
+2. **`content omitempty` on chatMessage.** Some servers reject `"content": ""` on assistant messages that have `tool_calls`.
+3. **System message never in the saved session or in `convo`.** It is built per model attempt in `build()`.
+4. **Save session on all exit paths** through `finish()`.
+5. **Single tty reader.** All prompts go through `ttyIO()`.
+6. **Child process in same process group** (sudo prompts).
+7. **Fallback triggers only on technical failures** (table above), never on a "bad" answer.
+8. **`normalizeBaseURL` is idempotent.**
+9. **All user-visible model-provided text goes through `sanitizeForDisplay`** (commands, paths, previews).
+10. **`cappedWriter.Write` always returns `(n, nil)`.**
+11. **Config mutations go through `updateConfig`**, never load-modify-`saveConfigFile` across a long-running operation.
+12. **File tools operate through `os.Root`** from `openAt` after `resolvePath`; never `os.ReadFile`/`os.WriteFile` on a model-supplied path directly.
+13. **Run flags are never persisted** (`-p`, `-m`, `--mode`, `--reasoning`).
 
 ---
 
@@ -517,31 +466,32 @@ User: clank -c -r "what's wrong with my nginx config"
 ```json
 {
   "active": "home",
+  "mode": "ask",
+  "language": "",
   "profiles": {
     "home": {
-      "base_url": "https://api.openai.com",
+      "base_url": "https://api.example.com",
       "api_key": "sk-...",
-      "models": ["gpt-4o", "gpt-4o-mini"],
-      "model": "gpt-4o",
       "proxy": "",
-      "use_tools": true,
+      "reasoning_default": "low",
       "exec_timeout_sec": 0,
-      "created": "2024-11-01T10:00:00Z"
+      "created": "2026-11-13T10:00:00Z",
+      "models": [
+        {"id": "big-model", "name": "Big", "tools": true, "vision": true, "reasoning": "high", "context": 1048576},
+        {"id": "small-model", "tools": true, "vision": false},
+        {"id": "flaky-model", "tools": false, "vision": false, "disabled": true}
+      ]
     }
-  },
-  "allowed_commands": ["git", "ls", "cat"]
+  }
 }
 ```
-
-`model` (singular) is always kept in sync with `models[0]` by `saveConfigFile`. It exists solely for backward compatibility with older clank versions.
 
 ---
 
 ## Things to watch out for
 
-- **`clank config add <name>`** works on the named profile, not the active one. Before this was fixed, the wizard silently modified the active profile instead.
-- **`clank config use <name>`** after `config rm <active>` auto-switches to newest remaining profile. After the fix, explicit `use` persists correctly.
-- **`-r` with a different profile** in session file: history is discarded with a notice. Don't suppress that notice.
-- **Reasoning models** (`reasoning_content` field, `<think>` blocks): handled in `chatComplete`. If adding a new model family with different output conventions, extend `chatComplete`, not the callers.
-- **`confimYN` with no TTY** returns `defaultYes`. In CI/cron this means setup wizards auto-accept defaults — which is the intended behavior.
-- **Spinner** is nil-safe: `startSpinner` returns `nil` when quiet/non-TTY, and `stopSpinner`/`setMessage` check `if s == nil` first.
+- **`-r` with a different profile** in the session file: history is discarded with a notice.
+- **Reasoning models** (`reasoning_content`, `<think>` blocks): handled in `chatComplete`/`streamAcc`. Extend those, not the callers.
+- **`confirmYN` with no TTY** returns `defaultYes`; **`confirmTool` with no TTY** always declines.
+- **`config rm` without a TTY** needs `-y`.
+- **Spinner** is nil-safe.

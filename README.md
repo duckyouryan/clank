@@ -40,11 +40,14 @@ sudo make install
 ## Quick start
 
 ```bash
-clank config init     # asks for the API address, key and model, saves a profile
+clank config create home --api-url https://api.example.com --api-key sk-... \
+  --model some-model --tools true --vision true
 clank "connection check"
 ```
 
-If you have several providers — create a profile for each (`clank config add ...`) and switch between them (`clank config use ...`).
+`clank models` lists what the provider offers. If you have several providers — create a profile for each (`clank config create ...`) and switch between them (`clank config use ...`); for a single run use `-p <profile>`.
+
+What the model may do is set by the mode: `clank mode ask` (default: reads freely, file writes and commands need confirmation), `read` (read-only) or `auto` (no confirmations).
 
 
 The full list of commands and flags is in the built-in help:

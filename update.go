@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 const repoReleasesURL = "https://api.github.com/repos/Gangsta0607/clank/releases/latest"
@@ -168,7 +169,7 @@ func cmdUpdate(args []string) int {
 	if err := applyUpdate(execPath, newBinData); err != nil {
 		fail(M.UpdApplyErr, execPath, err)
 		if cacheFile != "" {
-			fmt.Printf(M.UpdSudoHint)
+			fmt.Print(M.UpdSudoHint)
 		}
 		return exitConfig
 	}
@@ -182,8 +183,12 @@ func cmdUpdate(args []string) int {
 	return exitOK
 }
 
+// updateHTTPTimeout — потолок на запросы к GitHub: там обычный
+// request/response, а не поток, так что общий таймаут уместен.
+const updateHTTPTimeout = 2 * time.Minute
+
 func fetchLatestRelease() (githubRelease, error) {
-	client := &http.Client{Timeout: httpTimeout}
+	client := &http.Client{Timeout: updateHTTPTimeout}
 	req, err := http.NewRequest(http.MethodGet, repoReleasesURL, nil)
 	if err != nil {
 		return githubRelease{}, err
@@ -231,7 +236,7 @@ func findMatchingAsset(rel githubRelease) (url, name string, isZip bool, err err
 }
 
 func downloadAsset(url string) ([]byte, error) {
-	client := &http.Client{Timeout: httpTimeout}
+	client := &http.Client{Timeout: updateHTTPTimeout}
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -268,7 +273,7 @@ func extractBinary(archiveData []byte, isZip bool) ([]byte, error) {
 				return io.ReadAll(rc)
 			}
 		}
-		return nil, fmt.Errorf(M.UpdNoExeZip)
+		return nil, errors.New(M.UpdNoExeZip)
 	}
 
 	gr, err := gzip.NewReader(bytes.NewReader(archiveData))
@@ -292,7 +297,7 @@ func extractBinary(archiveData []byte, isZip bool) ([]byte, error) {
 		}
 	}
 
-	return nil, fmt.Errorf(M.UpdNoExeTar)
+	return nil, errors.New(M.UpdNoExeTar)
 }
 
 func applyUpdate(targetPath string, newBinary []byte) error {

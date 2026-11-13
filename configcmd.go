@@ -1,377 +1,898 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
+
+// --- разбор флагов ---
+
+type kv struct{ k, v string }
+
+// scanFlags раскладывает аргументы на позиционные и флаги, сохраняя
+// порядок флагов: в `config create` флаги модели относятся к последнему
+// --model. Флаги со значением принимаются как `--x v` и `--x=v`.
+func scanFlags(args []string, valueFlags, boolFlags []string) (pos []string, flags []kv, err error) {
+	isValue := map[string]bool{}
+	for _, f := range valueFlags {
+		isValue[f] = true
+	}
+	isBool := map[string]bool{}
+	for _, f := range boolFlags {
+		isBool[f] = true
+	}
+	literal := false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if literal || !strings.HasPrefix(a, "-") || a == "-" {
+			pos = append(pos, a)
+			continue
+		}
+		if a == "--" {
+			literal = true
+			continue
+		}
+		name, val, hasEq := strings.Cut(a, "=")
+		switch {
+		case isValue[name]:
+			if !hasEq {
+				if i+1 >= len(args) {
+					return nil, nil, fmt.Errorf(M.FlagNeedsValue, name)
+				}
+				i++
+				val = args[i]
+			}
+			flags = append(flags, kv{name, val})
+		case isBool[name] && !hasEq:
+			flags = append(flags, kv{name, ""})
+		default:
+			return nil, nil, fmt.Errorf(M.UnknownFlag, a)
+		}
+	}
+	return pos, flags, nil
+}
+
+func flagSet(flags []kv, name string) (string, bool) {
+	val, ok := "", false
+	for _, f := range flags {
+		if f.k == name {
+			val, ok = f.v, true
+		}
+	}
+	return val, ok
+}
+
+func parseBool(name, v string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "true", "yes", "on", "1", "y":
+		return true, nil
+	case "false", "no", "off", "0", "n":
+		return false, nil
+	}
+	return false, fmt.Errorf(M.BadBool, name, v)
+}
+
+// checkReasoningValue — уровень или off. on/true отвергаем: уровень
+// нужно назвать явно, провайдеры понимают только конкретные значения.
+func checkReasoningValue(v string) error {
+	v = strings.TrimSpace(v)
+	switch strings.ToLower(v) {
+	case "", "on", "true", "yes", "1":
+		return fmt.Errorf(M.BadReasoning, v)
+	}
+	if strings.ContainsAny(v, " \t,") {
+		return fmt.Errorf(M.BadReasoning, v)
+	}
+	return nil
+}
+
+func normReasoning(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	if v == "none" {
+		return "off"
+	}
+	return v
+}
+
+func parseTimeout(v string) (int, error) {
+	secs, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || secs < 0 {
+		return 0, errors.New(M.BadTimeout)
+	}
+	return secs, nil
+}
+
+// --- clank config ---
+
+func printConfigUsage() {
+	fmt.Fprintln(os.Stderr, M.ConfigUsage)
+}
 
 func cmdConfig(args []string) int {
 	if len(args) == 0 {
 		printConfigUsage()
 		return exitConfig
 	}
-
-	cf, err := loadConfigFile()
-	if err != nil {
-		fail("%v", err)
-		return exitConfig
-	}
-
+	rest := args[1:]
+	var err error
 	switch args[0] {
 	case "-h", "--help", "help":
 		printConfigUsage()
 		return exitOK
-
-	case "init":
-		return cmdConfigAdd(&cf, "default")
-
-	case "add":
-		if len(args) < 2 {
-			fail(M.NeedProfileName, "add")
-			return exitConfig
-		}
-		return cmdConfigAdd(&cf, args[1])
-
-	case "use":
-		if len(args) < 2 {
-			fail(M.NeedProfileName, "use")
-			return exitConfig
-		}
-		if _, ok := cf.Profiles[args[1]]; !ok {
-			fail(M.NoSuchProfileList, args[1], strings.Join(profileNames(cf), ", "))
-			return exitConfig
-		}
-		cf.Active = args[1]
-		if err := saveConfigFile(cf); err != nil {
-			fail(M.SaveFail, err)
-			return exitConfig
-		}
-		fmt.Println(M.ActiveProfileIs, args[1])
-		return exitOK
-
+	case "create":
+		err = configCreate(rest)
+	case "edit":
+		err = configEdit(rest)
 	case "list":
-		if len(cf.Profiles) == 0 {
-			fmt.Println(M.NoProfiles)
-			return exitOK
-		}
-		for _, n := range profileNames(cf) {
-			mark := "  "
-			if n == cf.Active {
-				mark = "* "
-			}
-			p := cf.Profiles[n]
-			fmt.Printf("%s%-15s tools=%-5v url=%-40s models=%s\n",
-				mark, n, p.UseTools, valueOr(p.BaseURL, "-"), valueOr(strings.Join(p.Models, ", "), "-"))
-		}
-		return exitOK
-
-	case "rm":
-		if len(args) < 2 {
-			fail(M.NeedProfileName, "rm")
-			return exitConfig
-		}
-		if _, ok := cf.Profiles[args[1]]; !ok {
-			fail(M.NoSuchProfile, args[1])
-			return exitConfig
-		}
-		delete(cf.Profiles, args[1])
-		if cf.Active == args[1] {
-			cf.Active = ""
-			if len(cf.Profiles) > 0 {
-				cf.Active = newestProfileName(cf)
-				info(M.ActiveRemoved, cf.Active)
-			}
-		}
-		if err := saveConfigFile(cf); err != nil {
-			fail(M.SaveFail, err)
-			return exitConfig
-		}
-		fmt.Println(M.RemovedIs, args[1])
-		return exitOK
-
+		err = configList(rest)
 	case "show":
-		name, p, err := activeProfile(&cf)
-		if err != nil {
-			fail("%v", err)
-			return exitConfig
-		}
-		path, _ := configPath()
-		fmt.Println(M.ShowFile, path)
-		fmt.Println(M.ShowProfile, name)
-		fmt.Println("base_url:  ", valueOr(p.BaseURL, M.ShowNotSet))
-		fmt.Println("api_key:   ", maskKey(p.APIKey))
-		if len(p.Models) == 0 {
-			fmt.Println(M.ShowModelsNone)
-		} else {
-			fmt.Println(M.ShowModelsHead)
-			for i, m := range p.Models {
-				fmt.Printf("             %d) %s\n", i+1, m)
-			}
-		}
-		fmt.Println("proxy:     ", valueOr(p.Proxy, M.ShowNoEnvProxy))
-		fmt.Println("use_tools: ", p.UseTools)
-		if p.Reasoning != nil {
-			state := M.ShowThinkOff
-			if *p.Reasoning {
-				state = M.ShowThinkOn
-			}
-			var details []string
-			if p.ReasoningEffort != "" {
-				details = append(details, "effort: "+p.ReasoningEffort)
-			}
-			if p.ReasoningBudget > 0 {
-				details = append(details, fmt.Sprintf("budget: %d", p.ReasoningBudget))
-			}
-			if len(details) > 0 {
-				fmt.Printf(M.ShowThinkCal, state, strings.Join(details, ", "))
-			} else {
-				fmt.Println(M.ShowThinkPlain, state)
-			}
-		} else {
-			fmt.Println(M.ShowThinkAuto)
-		}
-		if p.Vision != nil {
-			if *p.Vision {
-				fmt.Println(M.ShowVisionOn)
-			} else {
-				fmt.Println(M.ShowVisionOff)
-			}
-		} else {
-			fmt.Println(M.ShowVisionAuto)
-		}
-		fmt.Println(M.ShowTimeout, p.execTimeout())
-		if cf.Yolo {
-			fmt.Println(M.ShowYoloOn)
-		}
-		fmt.Println(M.ShowLanguage, showLanguage(cf.Language))
-		if len(cf.Allowed) > 0 {
-			var items []string
-			for k, lvl := range cf.Allowed {
-				items = append(items, fmt.Sprintf("%s (%s)", k, lvl))
-			}
-			sort.Strings(items)
-			fmt.Println(M.ShowAllowed, strings.Join(items, ", "))
-		}
-		return exitOK
-
-	case "set-url", "set-key", "set-model", "set-models", "set-proxy", "set-tools", "set-reasoning", "set-exec-timeout":
-		if len(args) < 2 {
-			fail(M.NeedValue, args[0])
-			return exitConfig
-		}
-		name, p, err := activeProfile(&cf)
-		if err != nil {
-			fail("%v", err)
-			return exitConfig
-		}
-		val := args[1]
-		switch args[0] {
-		case "set-url":
-			p.BaseURL = normalizeBaseURL(val)
-		case "set-key":
-			p.APIKey = val
-		case "set-model", "set-models":
-			// список через запятую = цепочка фоллбэка
-			var models []string
-			for _, m := range strings.Split(val, ",") {
-				if m = strings.TrimSpace(m); m != "" {
-					models = append(models, m)
-				}
-			}
-			if len(models) == 0 {
-				fail(M.ModelsEmpty)
-				return exitConfig
-			}
-			p.Models = models
-		case "set-proxy":
-			if val == "-" {
-				p.Proxy = ""
-			} else {
-				p.Proxy = val
-			}
-		case "set-tools":
-			p.UseTools = val == "true" || val == "1" || val == "y" || val == "yes"
-		case "set-reasoning":
-			switch strings.ToLower(val) {
-			case "on", "1", "true", "yes", "вкл":
-				v := true
-				p.Reasoning = &v
-			case "off", "0", "false", "no", "выкл":
-				v := false
-				p.Reasoning = &v
-			case "-", "none", "auto", "default", "сброс":
-				p.Reasoning = nil
-				p.ReasoningEffort = ""
-				p.ReasoningBudget = 0
-			default:
-				fail(M.BadSetReason, val)
-				return exitConfig
-			}
-		case "set-exec-timeout":
-			secs, err := strconv.Atoi(val)
-			if err != nil || secs < 0 {
-				fail(M.BadTimeout)
-				return exitConfig
-			}
-			p.ExecTimeoutSec = secs
-		}
-		cf.Profiles[name] = p
-		if err := saveConfigFile(cf); err != nil {
-			fail(M.SaveFail, err)
-			return exitConfig
-		}
-		fmt.Println(M.SavedOK)
-		return exitOK
-
-	case "test-tools":
-		name, _, err := activeProfile(&cf)
-		if err != nil {
-			fail("%v", err)
-			return exitConfig
-		}
-		return cmdTestTools(&cf, name)
-
-	case "test-reasoning":
-		name, _, err := activeProfile(&cf)
-		if err != nil {
-			fail("%v", err)
-			return exitConfig
-		}
-		return cmdTestReasoning(&cf, name)
-
-	case "test-vision":
-		name, _, err := activeProfile(&cf)
-		if err != nil {
-			fail("%v", err)
-			return exitConfig
-		}
-		return cmdTestVision(&cf, name)
-
-	case "test-model":
-		name, _, err := activeProfile(&cf)
-		if err != nil {
-			fail("%v", err)
-			return exitConfig
-		}
-		return cmdTestModel(&cf, name)
-
-	case "allow-rm":
-		if len(args) < 2 {
-			fail(M.AllowNeedName)
-			return exitConfig
-		}
-		if !cf.disallow(args[1]) {
-			fail(M.AllowNotListed, args[1])
-			return exitConfig
-		}
-		if err := saveConfigFile(cf); err != nil {
-			fail(M.SaveFail, err)
-			return exitConfig
-		}
-		fmt.Println(M.AllowRemoved, args[1])
-		return exitOK
-
-	case "allow-clear":
-		cf.Allowed = nil
-		if err := saveConfigFile(cf); err != nil {
-			fail(M.SaveFail, err)
-			return exitConfig
-		}
-		fmt.Println(M.AllowCleared)
-		return exitOK
-
+		err = configShow(rest)
+	case "use":
+		err = configUse(rest)
+	case "rm":
+		err = configRm(rest)
+	case "model":
+		return cmdConfigModel(rest)
 	default:
 		fail(M.UnknownSubcommand, args[0])
 		printConfigUsage()
 		return exitConfig
 	}
-}
-
-// cmdConfigAdd — мастер настройки профиля. Работает именно с тем профилем,
-// который создаёт: раньше он звал cmdModels/cmdTestTools, а те брали
-// активный профиль, и `config add work` при активном default молча
-// перенастраивал default.
-func cmdConfigAdd(cf *ConfigFile, name string) int {
-	if !haveTTY() {
-		fail(M.WizardNeedsTTY)
+	if err != nil {
+		fail("%v", err)
 		return exitConfig
 	}
-
-	existing, exists := cf.Profiles[name]
-	isNew := !exists
-	if isNew {
-		existing.Created = time.Now().Format(time.RFC3339)
-	}
-
-	fmt.Printf(M.WizardTitle+"\n", name)
-	existing.BaseURL = normalizeBaseURL(askLineDefault("base_url", existing.BaseURL, existing.BaseURL))
-	// Ключ показываем замаскированным: иначе он остаётся в скроллбэке
-	// терминала и в любой записи экрана.
-	existing.APIKey = askLineDefault("api_key", existing.APIKey, maskKey(existing.APIKey))
-
-	if cf.Profiles == nil {
-		cf.Profiles = map[string]Profile{}
-	}
-	cf.Profiles[name] = existing
-	if cf.Active == "" {
-		cf.Active = name
-	}
-	if err := saveConfigFile(*cf); err != nil {
-		fail(M.ConfigSaveFail, err)
-		return exitConfig
-	}
-	fmt.Println(M.ProfileSaved, name)
-
-	if isNew {
-		offerCompletion(cf)
-	}
-
-	if confirmYN(M.AskFetchModels, true) {
-		if code := selectModels(cf, name, ""); code != exitOK {
-			warn(M.ModelsFetchFail)
-		}
-	}
-
-	// Раньше при отказе или сетевой ошибке профиль оставался без модели,
-	// и первый же вопрос падал на проверке конфига.
-	if len(cf.Profiles[name].Models) == 0 {
-		line, ok := askLine(M.AskModelLine)
-		if ok && strings.TrimSpace(line) != "" {
-			p := cf.Profiles[name]
-			for _, m := range strings.Split(line, ",") {
-				if m = strings.TrimSpace(m); m != "" {
-					p.Models = append(p.Models, m)
-				}
-			}
-			cf.Profiles[name] = p
-			if err := saveConfigFile(*cf); err != nil {
-				fail(M.ConfigSaveFail, err)
-				return exitConfig
-			}
-		}
-	}
-
-	if len(cf.Profiles[name].Models) == 0 {
-		warn(M.ProfileNoModel)
-		return exitOK
-	}
-
-	if confirmYN(M.AskTestTools, true) {
-		return cmdTestTools(cf, name)
-	}
-
-	fmt.Println(M.ToolsSkipLater)
 	return exitOK
 }
 
+var (
+	profileValueFlags = []string{"--api-url", "--api-key", "--proxy", "--reasoning-default", "--exec-timeout"}
+	modelValueFlags   = []string{"--name", "--reasoning", "--tools", "--vision", "--context"}
+)
+
+// applyProfileFlag — общее для create и edit. "-" сбрасывает значение.
+func applyProfileFlag(p *Profile, f kv) error {
+	clear := f.v == "-"
+	switch f.k {
+	case "--api-url":
+		if clear || strings.TrimSpace(f.v) == "" {
+			return fmt.Errorf(M.NeedValueFor, f.k)
+		}
+		p.BaseURL = normalizeBaseURL(f.v)
+	case "--api-key":
+		if clear {
+			p.APIKey = ""
+		} else {
+			p.APIKey = strings.TrimSpace(f.v)
+		}
+	case "--proxy":
+		if clear {
+			p.Proxy = ""
+		} else {
+			p.Proxy = strings.TrimSpace(f.v)
+		}
+	case "--reasoning-default":
+		if clear {
+			p.ReasoningDefault = ""
+			return nil
+		}
+		if err := checkReasoningValue(f.v); err != nil {
+			return err
+		}
+		p.ReasoningDefault = normReasoning(f.v)
+	case "--exec-timeout":
+		secs, err := parseTimeout(f.v)
+		if err != nil {
+			return err
+		}
+		p.ExecTimeoutSec = secs
+	}
+	return nil
+}
+
+// applyModelFlag — общее для create, model add и model edit.
+func applyModelFlag(m *ModelEntry, f kv) error {
+	switch f.k {
+	case "--name":
+		if f.v == "-" {
+			m.Name = ""
+		} else {
+			m.Name = strings.TrimSpace(f.v)
+		}
+	case "--reasoning":
+		if f.v == "-" {
+			m.Reasoning = ""
+			return nil
+		}
+		if err := checkReasoningValue(f.v); err != nil {
+			return err
+		}
+		m.Reasoning = normReasoning(f.v)
+	case "--tools":
+		v, err := parseBool(f.k, f.v)
+		if err != nil {
+			return err
+		}
+		m.Tools = v
+	case "--vision":
+		v, err := parseBool(f.k, f.v)
+		if err != nil {
+			return err
+		}
+		m.Vision = v
+	case "--context":
+		if f.v == "-" {
+			m.Context = 0
+			return nil
+		}
+		n, err := parseTokens(f.v)
+		if err != nil {
+			return err
+		}
+		m.Context = n
+	}
+	return nil
+}
+
+// parseTokens — число токенов, можно с k/m: 131072, 128k, 1m.
+func parseTokens(v string) (int, error) {
+	s := strings.ToLower(strings.TrimSpace(v))
+	mult := 1
+	switch {
+	case strings.HasSuffix(s, "k"):
+		mult, s = 1024, strings.TrimSuffix(s, "k")
+	case strings.HasSuffix(s, "m"):
+		mult, s = 1024*1024, strings.TrimSuffix(s, "m")
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf(M.BadContext, v)
+	}
+	return n * mult, nil
+}
+
+// fmtTokens — обратно в короткую форму для таблицы.
+func fmtTokens(n int) string {
+	switch {
+	case n == 0:
+		return "-"
+	case n%(1024*1024) == 0:
+		return strconv.Itoa(n/(1024*1024)) + "m"
+	case n%1024 == 0:
+		return strconv.Itoa(n/1024) + "k"
+	case n >= 1000:
+		return strconv.Itoa(n/1000) + "k"
+	}
+	return strconv.Itoa(n)
+}
+
+func isOneOf(s string, list []string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+func configCreate(args []string) error {
+	valueFlags := append(append([]string{"--model"}, profileValueFlags...), modelValueFlags...)
+	pos, flags, err := scanFlags(args, valueFlags, nil)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 || strings.TrimSpace(pos[0]) == "" {
+		return fmt.Errorf(M.NeedProfileName, "create")
+	}
+	name := pos[0]
+
+	p := Profile{Created: time.Now().Format(time.RFC3339)}
+	cur := -1
+	for _, f := range flags {
+		switch {
+		case f.k == "--model":
+			id := strings.TrimSpace(f.v)
+			if id == "" {
+				return fmt.Errorf(M.NeedValueFor, f.k)
+			}
+			for _, m := range p.Models {
+				if m.ID == id {
+					return fmt.Errorf(M.ModelExists, id)
+				}
+			}
+			p.Models = append(p.Models, ModelEntry{ID: id})
+			cur = len(p.Models) - 1
+		case isOneOf(f.k, modelValueFlags):
+			if cur < 0 {
+				return fmt.Errorf(M.ModelFlagFirst, f.k)
+			}
+			if err := applyModelFlag(&p.Models[cur], f); err != nil {
+				return err
+			}
+		default:
+			if err := applyProfileFlag(&p, f); err != nil {
+				return err
+			}
+		}
+	}
+	if p.BaseURL == "" {
+		return fmt.Errorf(M.NeedValueFor, "--api-url")
+	}
+
+	cf, err := updateConfig(func(cf *ConfigFile) error {
+		if _, ok := cf.Profiles[name]; ok {
+			return fmt.Errorf(M.ProfileExists, name)
+		}
+		cf.Profiles[name] = p
+		if _, ok := cf.Profiles[cf.Active]; !ok {
+			cf.Active = name
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Println(M.ProfileCreated, name)
+	if cf.Active == name {
+		fmt.Println(M.ActiveProfileIs, name)
+	}
+	if len(p.Models) == 0 {
+		info(M.ProfileNoModel, name)
+	}
+	offerCompletion(&cf)
+	return nil
+}
+
+func configEdit(args []string) error {
+	pos, flags, err := scanFlags(args, append([]string{"-p", "--profile", "--rename"}, profileValueFlags...), nil)
+	if err != nil {
+		return err
+	}
+	if len(pos) > 0 {
+		return fmt.Errorf(M.UnexpectedArg, pos[0])
+	}
+	target, _ := flagSet(flags, "-p")
+	if v, ok := flagSet(flags, "--profile"); ok {
+		target = v
+	}
+	changes := 0
+	for _, f := range flags {
+		if f.k != "-p" && f.k != "--profile" {
+			changes++
+		}
+	}
+	if changes == 0 {
+		return errors.New(M.EditNothing)
+	}
+
+	var finalName string
+	_, err = updateConfig(func(cf *ConfigFile) error {
+		name, p, err := resolveProfile(cf, target)
+		if err != nil {
+			return err
+		}
+		newName := name
+		for _, f := range flags {
+			switch f.k {
+			case "-p", "--profile":
+			case "--rename":
+				nn := strings.TrimSpace(f.v)
+				if nn == "" {
+					return fmt.Errorf(M.NeedValueFor, f.k)
+				}
+				if _, ok := cf.Profiles[nn]; ok && nn != name {
+					return fmt.Errorf(M.ProfileExists, nn)
+				}
+				newName = nn
+			default:
+				if err := applyProfileFlag(&p, f); err != nil {
+					return err
+				}
+			}
+		}
+		delete(cf.Profiles, name)
+		cf.Profiles[newName] = p
+		if cf.Active == name {
+			cf.Active = newName
+		}
+		finalName = newName
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Println(M.SavedProfile, finalName)
+	return nil
+}
+
+func configList(args []string) error {
+	if len(args) > 0 {
+		return fmt.Errorf(M.UnexpectedArg, args[0])
+	}
+	cf, err := loadConfigFile()
+	if err != nil {
+		return err
+	}
+	if len(cf.Profiles) == 0 {
+		fmt.Println(M.NoProfiles)
+		return nil
+	}
+	names := profileNames(cf)
+	w := 0
+	for _, n := range names {
+		w = max(w, utf8.RuneCountInString(n))
+	}
+	for _, n := range names {
+		mark := "  "
+		if n == cf.Active {
+			mark = "* "
+		}
+		p := cf.Profiles[n]
+		active := "-"
+		if i := p.activeIndex(); i >= 0 {
+			active = p.Models[i].ID
+		}
+		// Имя профиля — второе поле строки: по нему режут скрипты автодополнения.
+		fmt.Printf("%s%s  %s  %s\n", mark, padRight(n, w), valueOr(p.BaseURL, "-"),
+			fmt.Sprintf(M.ListModels, active, len(p.Models)))
+	}
+	return nil
+}
+
+func padRight(s string, w int) string {
+	if n := utf8.RuneCountInString(s); n < w {
+		return s + strings.Repeat(" ", w-n)
+	}
+	return s
+}
+
+func configShow(args []string) error {
+	if len(args) > 1 {
+		return fmt.Errorf(M.UnexpectedArg, args[1])
+	}
+	cf, err := loadConfigFile()
+	if err != nil {
+		return err
+	}
+	target := ""
+	if len(args) == 1 {
+		target = args[0]
+	}
+	name, p, err := resolveProfile(&cf, target)
+	if err != nil {
+		return err
+	}
+	path, _ := configPath()
+	yesNo := func(b bool) string {
+		if b {
+			return M.Yes
+		}
+		return M.No
+	}
+	fmt.Println(M.ShowFile, path)
+	fmt.Println(M.ShowProfile, name)
+	fmt.Println(M.ShowActive, yesNo(cf.Active == name))
+	fmt.Println(M.ShowURL, valueOr(p.BaseURL, M.ShowNotSet))
+	fmt.Println(M.ShowKey, maskKey(p.APIKey))
+	fmt.Println(M.ShowProxy, valueOr(p.Proxy, M.ShowEnvProxy))
+	fmt.Println(M.ShowReasonDef, valueOr(p.ReasoningDefault, M.ShowProvider))
+	fmt.Println(M.ShowTimeout, p.execTimeout())
+	fmt.Println(M.ShowMode, modeLabel(cf.mode()))
+	fmt.Println(M.ShowLanguage, showLanguage(cf.Language))
+	fmt.Println(M.ShowModels)
+	printModelTable(p, "  ")
+	return nil
+}
+
+func configUse(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf(M.NeedProfileName, "use")
+	}
+	name := args[0]
+	_, err := updateConfig(func(cf *ConfigFile) error {
+		if _, ok := cf.Profiles[name]; !ok {
+			return fmt.Errorf(M.NoSuchProfileList, name, strings.Join(profileNames(*cf), ", "))
+		}
+		cf.Active = name
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Println(M.ActiveProfileIs, name)
+	return nil
+}
+
+func configRm(args []string) error {
+	pos, flags, err := scanFlags(args, nil, []string{"-y", "--yes"})
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return fmt.Errorf(M.NeedProfileName, "rm")
+	}
+	name := pos[0]
+	cf, err := loadConfigFile()
+	if err != nil {
+		return err
+	}
+	if _, ok := cf.Profiles[name]; !ok {
+		return fmt.Errorf(M.NoSuchProfileList, name, strings.Join(profileNames(cf), ", "))
+	}
+	_, y1 := flagSet(flags, "-y")
+	_, y2 := flagSet(flags, "--yes")
+	if !y1 && !y2 {
+		if !haveTTY() {
+			return errors.New(M.RmNeedsYes)
+		}
+		if !confirmYN(fmt.Sprintf(M.RmAsk, name), false) {
+			fmt.Println(M.Aborted)
+			return nil
+		}
+	}
+	var newActive string
+	_, err = updateConfig(func(cf *ConfigFile) error {
+		delete(cf.Profiles, name)
+		if cf.Active == name {
+			cf.Active = ""
+			if len(cf.Profiles) > 0 {
+				cf.Active = newestProfileName(*cf)
+				newActive = cf.Active
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Println(M.RemovedIs, name)
+	if newActive != "" {
+		info(M.ActiveRemoved, newActive)
+	}
+	return nil
+}
+
+// --- clank config model ---
+
+func cmdConfigModel(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, M.ModelUsage)
+		return exitConfig
+	}
+	verb, rest := args[0], args[1:]
+	var err error
+	switch verb {
+	case "-h", "--help", "help":
+		fmt.Fprintln(os.Stderr, M.ModelUsage)
+		return exitOK
+	case "list":
+		err = modelList(rest)
+	case "add":
+		err = modelAdd(rest)
+	case "edit":
+		err = modelEdit(rest)
+	case "rm":
+		err = modelSimple(verb, rest)
+	case "activate":
+		err = modelSimple(verb, rest)
+	case "enable":
+		err = modelSimple(verb, rest)
+	case "disable":
+		err = modelSimple(verb, rest)
+	case "move":
+		err = modelMove(rest)
+	default:
+		fail(M.UnknownSubcommand, verb)
+		fmt.Fprintln(os.Stderr, M.ModelUsage)
+		return exitConfig
+	}
+	if err != nil {
+		fail("%v", err)
+		return exitConfig
+	}
+	return exitOK
+}
+
+func profileFlag(flags []kv) string {
+	name, _ := flagSet(flags, "-p")
+	if v, ok := flagSet(flags, "--profile"); ok {
+		name = v
+	}
+	return name
+}
+
+// editModels — общий каркас правки моделей: свежий конфиг, профиль из
+// -p или активный, изменение, сохранение. Возвращает итоговый профиль
+// для печати.
+func editModels(target string, fn func(p *Profile) error) (string, Profile, error) {
+	var (
+		name string
+		out  Profile
+	)
+	_, err := updateConfig(func(cf *ConfigFile) error {
+		n, p, err := resolveProfile(cf, target)
+		if err != nil {
+			return err
+		}
+		if err := fn(&p); err != nil {
+			return err
+		}
+		cf.Profiles[n] = p
+		name, out = n, p
+		return nil
+	})
+	return name, out, err
+}
+
+func modelList(args []string) error {
+	pos, flags, err := scanFlags(args, []string{"-p", "--profile"}, nil)
+	if err != nil {
+		return err
+	}
+	if len(pos) > 0 {
+		return fmt.Errorf(M.UnexpectedArg, pos[0])
+	}
+	cf, err := loadConfigFile()
+	if err != nil {
+		return err
+	}
+	name, p, err := resolveProfile(&cf, profileFlag(flags))
+	if err != nil {
+		return err
+	}
+	fmt.Printf(M.ModelsOf+"\n", name)
+	printModelTable(p, "")
+	return nil
+}
+
+// printModelTable — нумерованный список моделей: номер годится вместо id
+// во всех командах `config model`.
+func printModelTable(p Profile, indent string) {
+	if len(p.Models) == 0 {
+		fmt.Println(indent + M.NoModelsYet)
+		return
+	}
+	active := p.activeIndex()
+	rows := [][]string{{"#", M.ColModel, M.ColTools, M.ColVision, M.ColReasoning, M.ColContext, ""}}
+	for i, m := range p.Models {
+		r := m.Reasoning
+		if r == "" {
+			if p.ReasoningDefault != "" {
+				r = p.ReasoningDefault + " " + M.FromProfile
+			} else {
+				r = "-"
+			}
+		}
+		note := ""
+		switch {
+		case m.Disabled:
+			note = M.MarkDisabled
+		case i == active:
+			note = M.MarkActive
+		}
+		rows = append(rows, []string{strconv.Itoa(i + 1), m.label(), check(m.Tools), check(m.Vision), r, fmtTokens(m.Context), note})
+	}
+	widths := make([]int, len(rows[0]))
+	for _, row := range rows {
+		for j, c := range row {
+			widths[j] = max(widths[j], utf8.RuneCountInString(c))
+		}
+	}
+	for _, row := range rows {
+		var b strings.Builder
+		b.WriteString(indent)
+		for j, c := range row {
+			if j > 0 {
+				b.WriteString("  ")
+			}
+			if j == 0 {
+				b.WriteString(strings.Repeat(" ", widths[j]-utf8.RuneCountInString(c)) + c)
+			} else {
+				b.WriteString(padRight(c, widths[j]))
+			}
+		}
+		fmt.Println(strings.TrimRight(b.String(), " "))
+	}
+}
+
+func check(b bool) string {
+	if b {
+		return "✓"
+	}
+	return "·"
+}
+
+func modelAdd(args []string) error {
+	pos, flags, err := scanFlags(args, append([]string{"-p", "--profile", "--pos"}, modelValueFlags...), nil)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 || strings.TrimSpace(pos[0]) == "" {
+		return fmt.Errorf(M.NeedModelID, "add")
+	}
+	m := ModelEntry{ID: strings.TrimSpace(pos[0])}
+	at := -1
+	for _, f := range flags {
+		switch f.k {
+		case "-p", "--profile":
+		case "--pos":
+			n, err := strconv.Atoi(f.v)
+			if err != nil || n < 1 {
+				return fmt.Errorf(M.BadPos, f.v)
+			}
+			at = n - 1
+		default:
+			if err := applyModelFlag(&m, f); err != nil {
+				return err
+			}
+		}
+	}
+	name, p, err := editModels(profileFlag(flags), func(p *Profile) error {
+		for _, e := range p.Models {
+			if e.ID == m.ID {
+				return fmt.Errorf(M.ModelExists, m.ID)
+			}
+		}
+		if at < 0 || at > len(p.Models) {
+			at = len(p.Models)
+		}
+		p.Models = append(p.Models[:at], append([]ModelEntry{m}, p.Models[at:]...)...)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf(M.ModelAdded+"\n", m.ID, name)
+	printModelTable(p, "")
+	return nil
+}
+
+func modelEdit(args []string) error {
+	pos, flags, err := scanFlags(args, append([]string{"-p", "--profile", "--new-id"}, modelValueFlags...), nil)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return fmt.Errorf(M.NeedModelID, "edit")
+	}
+	changes := 0
+	for _, f := range flags {
+		if f.k != "-p" && f.k != "--profile" {
+			changes++
+		}
+	}
+	if changes == 0 {
+		return errors.New(M.EditNothing)
+	}
+	_, p, err := editModels(profileFlag(flags), func(p *Profile) error {
+		i, err := p.findModel(pos[0])
+		if err != nil {
+			return err
+		}
+		m := p.Models[i]
+		for _, f := range flags {
+			switch f.k {
+			case "-p", "--profile":
+			case "--new-id":
+				id := strings.TrimSpace(f.v)
+				if id == "" {
+					return fmt.Errorf(M.NeedValueFor, f.k)
+				}
+				for j, e := range p.Models {
+					if j != i && e.ID == id {
+						return fmt.Errorf(M.ModelExists, id)
+					}
+				}
+				m.ID = id
+			default:
+				if err := applyModelFlag(&m, f); err != nil {
+					return err
+				}
+			}
+		}
+		p.Models[i] = m
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	printModelTable(p, "")
+	return nil
+}
+
+// modelSimple — rm / activate / enable / disable: одна модель, без флагов
+// кроме -p.
+func modelSimple(verb string, args []string) error {
+	pos, flags, err := scanFlags(args, []string{"-p", "--profile"}, nil)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return fmt.Errorf(M.NeedModelID, verb)
+	}
+	_, p, err := editModels(profileFlag(flags), func(p *Profile) error {
+		i, err := p.findModel(pos[0])
+		if err != nil {
+			return err
+		}
+		switch verb {
+		case "rm":
+			p.Models = append(p.Models[:i], p.Models[i+1:]...)
+		case "activate":
+			// Активная = первая в списке. Выключенную при этом включаем:
+			// раз её явно сделали активной, пропускать её странно.
+			m := p.Models[i]
+			m.Disabled = false
+			p.Models = append(p.Models[:i], p.Models[i+1:]...)
+			p.Models = append([]ModelEntry{m}, p.Models...)
+		case "enable":
+			p.Models[i].Disabled = false
+		case "disable":
+			p.Models[i].Disabled = true
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	printModelTable(p, "")
+	if len(p.Models) > 0 && p.activeIndex() < 0 {
+		warn(M.AllDisabled)
+	}
+	return nil
+}
+
+func modelMove(args []string) error {
+	pos, flags, err := scanFlags(args, []string{"-p", "--profile"}, nil)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 2 {
+		return errors.New(M.MoveUsage)
+	}
+	to, err := strconv.Atoi(pos[1])
+	if err != nil || to < 1 {
+		return fmt.Errorf(M.BadPos, pos[1])
+	}
+	_, p, err := editModels(profileFlag(flags), func(p *Profile) error {
+		i, err := p.findModel(pos[0])
+		if err != nil {
+			return err
+		}
+		m := p.Models[i]
+		p.Models = append(p.Models[:i], p.Models[i+1:]...)
+		at := min(to-1, len(p.Models))
+		p.Models = append(p.Models[:at], append([]ModelEntry{m}, p.Models[at:]...)...)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	printModelTable(p, "")
+	return nil
+}
+
+// --- clank models ---
+
+// cmdModels печатает модели провайдера — подсказка, что вписывать в
+// `config model add`. Нетекстовые (эмбеддинги, речь, картинки на выходе)
+// скрыты, если провайдер отдаёт метаданные; возможности показаны тоже
+// только из метаданных — проверять их нечем.
 func cmdModels(args []string) int {
-	var filter string
-	for _, a := range args {
-		switch a {
+	pos, flags, err := scanFlags(args, []string{"-p", "--profile"}, []string{"-v", "--verbose", "-q", "--quiet", "-h", "--help", "--all"})
+	if err != nil {
+		fail("%v", err)
+		return exitConfig
+	}
+	showAll := false
+	for _, f := range flags {
+		switch f.k {
 		case "-v", "--verbose":
 			verboseLevel = vVerbose
 		case "-q", "--quiet":
@@ -379,51 +900,48 @@ func cmdModels(args []string) int {
 		case "-h", "--help":
 			fmt.Fprintln(os.Stderr, M.ModelsHelp)
 			return exitOK
-		default:
-			filter = a
+		case "--all":
+			showAll = true
 		}
 	}
+	filter := strings.ToLower(strings.Join(pos, " "))
 
 	cf, err := loadConfigFile()
 	if err != nil {
 		fail("%v", err)
 		return exitConfig
 	}
-	name, _, err := activeProfile(&cf)
+	name, p, err := resolveProfile(&cf, profileFlag(flags))
 	if err != nil {
 		fail("%v", err)
 		return exitConfig
 	}
-	return selectModels(&cf, name, filter)
-}
-
-// selectModels показывает модели конкретного профиля и, если есть куда
-// спросить, даёт выбрать цепочку фоллбэка.
-func selectModels(cf *ConfigFile, name, filter string) int {
-	p := cf.Profiles[name]
-	if p.BaseURL == "" || p.APIKey == "" {
-		fail(M.ModelsNeedCreds, name)
+	if p.BaseURL == "" {
+		fail(M.ModelsNeedURL, name)
 		return exitConfig
 	}
 
 	sp := startSpinner(M.FetchingModels)
-	ids, err := listModels(p)
+	list, err := listModels(p)
 	sp.stopSpinner()
 	if err != nil {
 		fail("%v", err)
 		return exitAPI
 	}
 
-	if filter != "" {
-		var kept []string
-		for _, id := range ids {
-			if strings.Contains(strings.ToLower(id), strings.ToLower(filter)) {
-				kept = append(kept, id)
-			}
+	var kept []remoteModel
+	hidden := 0
+	for _, m := range list {
+		if filter != "" && !strings.Contains(strings.ToLower(m.ID+" "+m.Name), filter) {
+			continue
 		}
-		ids = kept
+		if !showAll && !m.textOutput() {
+			hidden++
+			continue
+		}
+		kept = append(kept, m)
 	}
-	if len(ids) == 0 {
+	if len(kept) == 0 {
 		if filter != "" {
 			fail(M.FilterNoMatch, filter)
 		} else {
@@ -431,338 +949,76 @@ func selectModels(cf *ConfigFile, name, filter string) int {
 		}
 		return exitAPI
 	}
-	sort.Strings(ids)
+	sort.Slice(kept, func(i, j int) bool { return kept[i].ID < kept[j].ID })
 
-	// В пайпе интерактив бессмысленен: раньше чтение номера уходило в
-	// тот же пайп, откуда читался контекст.
-	if !isTTY(os.Stdout) || !haveTTY() {
-		for _, id := range ids {
-			fmt.Println(id)
+	w := 0
+	for _, m := range kept {
+		w = max(w, utf8.RuneCountInString(m.ID))
+	}
+	for _, m := range kept {
+		var tags []string
+		if containsString(m.SupportedParameters, "tools") {
+			tags = append(tags, "tools")
 		}
-		return exitOK
-	}
-
-	current := map[string]int{}
-	for i, m := range p.Models {
-		current[m] = i + 1
-	}
-
-	cells := make([]string, len(ids))
-	for i, id := range ids {
-		mark := " "
-		if n, ok := current[id]; ok {
-			mark = strconv.Itoa(n) // текущая позиция в цепочке
+		if containsString(m.Architecture.InputModalities, "image") {
+			tags = append(tags, "vision")
 		}
-		cells[i] = fmt.Sprintf("%s%3d) %s", mark, i+1, id)
-	}
-	for _, line := range layoutColumns(cells, termWidth()) {
+		if m.Reasoning != nil && len(m.Reasoning.SupportedEfforts) > 0 {
+			tags = append(tags, "reasoning:"+strings.Join(m.Reasoning.SupportedEfforts, ","))
+		}
+		if m.ContextLength > 0 {
+			tags = append(tags, "context:"+fmtTokens(m.ContextLength))
+		}
+		line := m.ID
+		if len(tags) > 0 {
+			line = padRight(m.ID, w) + "  " + strings.Join(tags, " ")
+		}
 		fmt.Println(line)
 	}
-	if len(current) > 0 {
-		fmt.Println(M.ChainHint)
-	}
-
-	line, ok := askLine(M.AskChainNumbers)
-	if !ok || line == "" {
-		fmt.Println(M.Cancelled)
-		return exitOK
-	}
-
-	var chosen []string
-	seen := map[string]bool{}
-	for _, part := range strings.Split(line, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		n, err := strconv.Atoi(part)
-		if err != nil || n < 1 || n > len(ids) {
-			fail(M.BadNumber, part, len(ids))
-			return exitConfig
-		}
-		if !seen[ids[n-1]] {
-			seen[ids[n-1]] = true
-			chosen = append(chosen, ids[n-1])
-		}
-	}
-	if len(chosen) == 0 {
-		fmt.Println(M.Cancelled)
-		return exitOK
-	}
-
-	p.Models = chosen
-	cf.Profiles[name] = p
-	if err := saveConfigFile(*cf); err != nil {
-		fail(M.ConfigSaveFail, err)
-		return exitConfig
-	}
-	if len(chosen) == 1 {
-		fmt.Println(M.ModelSet, chosen[0])
-	} else {
-		fmt.Println(M.ChainSet, strings.Join(chosen, " → "))
+	if hidden > 0 {
+		info(M.ModelsHidden, hidden)
 	}
 	return exitOK
 }
 
-func cmdTestTools(cf *ConfigFile, name string) int {
-	p := cf.Profiles[name]
-	if err := p.validate(); err != nil {
-		fail("%v", err)
-		return exitConfig
-	}
+// --- clank mode ---
 
-	model := p.Models[0]
-	fmt.Println(M.TestToolsCheck, model, "...")
-	sp := startSpinner(M.WaitingAnswer)
-	ok, detailText, err := testToolSupport(p, model)
-	sp.stopSpinner()
-	if err != nil {
-		fail("%v", err)
-		return exitAPI
+func modeLabel(m ToolMode) string {
+	switch m {
+	case ModeAuto:
+		return M.ModeAutoDesc
+	case ModeRead:
+		return M.ModeReadDesc
 	}
-	if ok {
-		fmt.Println(M.ToolCalled, sanitizeForDisplay(truncateRunes(detailText, 300)))
-	} else {
-		fmt.Println(M.ToolNotCalled, truncateRunes(detailText, 300))
-	}
-	if len(p.Models) > 1 {
-		info(M.ChainFirstOnly)
-	}
-
-	if confirmYN(fmt.Sprintf(M.AskSaveTools, ok, name), true) {
-		p.UseTools = ok
-		cf.Profiles[name] = p
-		if err := saveConfigFile(*cf); err != nil {
-			fail(M.SaveFail, err)
-			return exitConfig
-		}
-		fmt.Println(M.SavedOK)
-	} else {
-		fmt.Println(M.SavedNot)
-	}
-	return exitOK
+	return M.ModeAskDesc
 }
 
-func cmdTestReasoning(cf *ConfigFile, name string) int {
-	p := cf.Profiles[name]
-	if err := p.validate(); err != nil {
-		fail("%v", err)
-		return exitConfig
-	}
-
-	model := p.Models[0]
-	fmt.Println(M.TestReasonCheck, model, "...")
-	sp := startSpinner(M.TestingParams)
-	res, err := testReasoningSupport(p, model)
-	sp.stopSpinner()
-	if err != nil {
-		fail("%v", err)
-		return exitAPI
-	}
-
-	fmt.Println(M.ReasonResults)
-	printReasoningResult(res)
-
-	supported := res.EffortOn != "" || res.EffortOff != "" || res.UsesBudget || res.HasOutput
-	if !supported {
-		info(M.ReasonUnsupported)
+func cmdMode(args []string) int {
+	if len(args) == 0 || args[0] == "show" {
+		cf, err := loadConfigFile()
+		if err != nil {
+			fail("%v", err)
+			return exitConfig
+		}
+		fmt.Println(M.ModeIs, modeLabel(cf.mode()))
 		return exitOK
 	}
-
-	if confirmYN(fmt.Sprintf(M.AskReasonOn, name), true) {
-		v := true
-		p.Reasoning = &v
-		if res.EffortOn != "" {
-			p.ReasoningEffort = res.EffortOn
-		}
-		if res.UsesBudget {
-			p.ReasoningBudget = res.BudgetOn
-		}
-		cf.Profiles[name] = p
-		if err := saveConfigFile(*cf); err != nil {
-			fail(M.SaveFail, err)
-			return exitConfig
-		}
-		fmt.Println(M.SavedReasonOn)
-	} else {
-		fmt.Println(M.SettingsKept)
-	}
-	return exitOK
-}
-
-// printReasoningResult печатает итог проверки reasoning нейтрально:
-// что поддерживается и найден ли блок — без verdict'ов.
-func printReasoningResult(res reasoningTestResult) {
-	if res.EffortOn != "" || res.EffortOff != "" {
-		fmt.Printf(M.ReasonEffortOK,
-			valueOr(res.EffortOn, M.ReasonNone), valueOr(res.EffortOff, M.ReasonNone))
-	} else if res.UsesBudget {
-		fmt.Println(M.ReasonBudgetOK)
-	} else {
-		fmt.Println(M.ReasonNoParams)
-	}
-
-	if res.HasOutput {
-		fmt.Println(M.ReasonHasOutput)
-	} else {
-		fmt.Println(M.ReasonNoOutput)
-	}
-}
-
-func cmdTestVision(cf *ConfigFile, name string) int {
-	p := cf.Profiles[name]
-	if err := p.validate(); err != nil {
-		fail("%v", err)
-		return exitConfig
-	}
-
-	model := p.Models[0]
-	fmt.Println(M.TestVisionCheck, model, "...")
-	sp := startSpinner(M.WaitingAnswer)
-	ok, detailText, err := testVisionSupport(p, model)
-	sp.stopSpinner()
-	if err != nil {
-		fail("%v", err)
-		return exitAPI
-	}
-	if ok {
-		fmt.Println(M.VisionOK, sanitizeForDisplay(truncateRunes(detailText, 300)))
-		fmt.Println(M.VisionJudge)
-	} else {
-		fmt.Println(M.VisionFail)
-	}
-	if confirmYN(fmt.Sprintf(M.AskSaveVision, ok, name), true) {
-		p.Vision = &ok
-		cf.Profiles[name] = p
-		if err := saveConfigFile(*cf); err != nil {
-			fail(M.SaveFail, err)
-			return exitConfig
-		}
-		fmt.Println(M.SavedOK)
-	} else {
-		fmt.Println(M.SavedNot)
-	}
-	return exitOK
-}
-
-// cmdTestModel гоняет все три проверки разом (tools, reasoning, vision)
-// и сохраняет всё одним вопросом. Отчёты нейтральные: факты плюс ответ
-// модели, выводы — на пользователе.
-func cmdTestModel(cf *ConfigFile, name string) int {
-	p := cf.Profiles[name]
-	if err := p.validate(); err != nil {
-		fail("%v", err)
-		return exitConfig
-	}
-
-	model := p.Models[0]
-	fmt.Printf(M.TestModelCheck+"\n", model)
-
-	sp := startSpinner(M.WaitingAnswer)
-	toolsOK, toolsDetail, err := testToolSupport(p, model)
-	sp.stopSpinner()
-	if err != nil {
-		fail("%v", err)
-		return exitAPI
-	}
-	if toolsOK {
-		fmt.Println(M.ToolCalled, sanitizeForDisplay(truncateRunes(toolsDetail, 300)))
-	} else {
-		fmt.Println(M.ToolNotCalled, truncateRunes(toolsDetail, 300))
-	}
-
-	sp = startSpinner(M.TestingParams)
-	rres, err := testReasoningSupport(p, model)
-	sp.stopSpinner()
-	if err != nil {
-		fail("%v", err)
-		return exitAPI
-	}
-	printReasoningResult(rres)
-	reasonOK := rres.EffortOn != "" || rres.EffortOff != "" || rres.UsesBudget || rres.HasOutput
-
-	sp = startSpinner(M.WaitingAnswer)
-	visOK, visDetail, err := testVisionSupport(p, model)
-	sp.stopSpinner()
-	if err != nil {
-		fail("%v", err)
-		return exitAPI
-	}
-	if visOK {
-		fmt.Println(M.VisionOK, sanitizeForDisplay(truncateRunes(visDetail, 300)))
-		fmt.Println(M.VisionJudge)
-	} else {
-		fmt.Println(M.VisionFail)
-	}
-
-	if len(p.Models) > 1 {
-		info(M.ChainFirstOnly)
-	}
-
-	if confirmYN(fmt.Sprintf(M.AskSaveModel, name), true) {
-		p.UseTools = toolsOK
-		p.Vision = &visOK
-		if reasonOK {
-			v := true
-			p.Reasoning = &v
-			if rres.EffortOn != "" {
-				p.ReasoningEffort = rres.EffortOn
-			}
-			if rres.UsesBudget {
-				p.ReasoningBudget = rres.BudgetOn
-			}
-		}
-		cf.Profiles[name] = p
-		if err := saveConfigFile(*cf); err != nil {
-			fail(M.SaveFail, err)
-			return exitConfig
-		}
-		fmt.Println(M.SavedOK)
-	} else {
-		fmt.Println(M.SavedNot)
-	}
-	return exitOK
-}
-
-func printConfigUsage() {
-	fmt.Fprintln(os.Stderr, M.ConfigUsage)
-}
-
-func cmdYolo(args []string) int {
-	cf, err := loadConfigFile()
-	if err != nil {
-		fail("%v", err)
-		return exitConfig
-	}
-
-	if len(args) == 0 {
-		if cf.Yolo {
-			fmt.Println(M.YoloIsOn)
-		} else {
-			fmt.Println(M.YoloIsOff)
-		}
+	if args[0] == "-h" || args[0] == "--help" {
+		fmt.Println(M.HelpMode)
 		return exitOK
 	}
-
-	switch strings.ToLower(args[0]) {
-	case "on", "1", "true", "enable":
-		cf.Yolo = true
-		if err := saveConfigFile(cf); err != nil {
-			fail(M.SaveFail, err)
-			return exitConfig
-		}
-		fmt.Println(M.YoloGlobalOn)
-		return exitOK
-	case "off", "0", "false", "disable":
-		cf.Yolo = false
-		if err := saveConfigFile(cf); err != nil {
-			fail(M.SaveFail, err)
-			return exitConfig
-		}
-		fmt.Println(M.YoloGlobalOff)
-		return exitOK
-	default:
-		fail(M.YoloBadArg, args[0])
+	m, ok := parseMode(args[0])
+	if !ok {
+		fail(M.BadMode, args[0])
 		return exitConfig
 	}
+	if _, err := updateConfig(func(cf *ConfigFile) error {
+		cf.Mode = m
+		return nil
+	}); err != nil {
+		fail("%v", err)
+		return exitConfig
+	}
+	fmt.Println(M.ModeIs, modeLabel(m))
+	return exitOK
 }

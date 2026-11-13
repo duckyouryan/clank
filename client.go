@@ -1,22 +1,41 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const (
-	httpTimeout = 120 * time.Second
-	maxRetries  = 3 // на одну модель, до перехода к следующей в цепочке
+	// Потолок ожидания перед повтором на той же модели: Retry-After длиннее
+	// этого — сразу к следующей модели, а не висеть минуту.
+	maxRetryWait = 10 * time.Second
+
+	// Ответ принимается потоком (SSE), поэтому таймауты считают тишину,
+	// а не длину всего ответа: длинная генерация жива, пока идут куски.
+	dialTimeout = 10 * time.Second
+	// До первого события: сюда входят подключение, очередь у провайдера
+	// и время до первого токена. Reasoning-модели обычно стримят мысли
+	// (reasoning_content), роутеры шлют keep-alive комментарии — это тоже
+	// считается признаком жизни.
+	firstEventTimeout = 90 * time.Second
+	// Между событиями внутри потока.
+	idleEventTimeout = 30 * time.Second
 )
 
 type toolCall struct {
@@ -80,111 +99,20 @@ func (m chatMessage) Text() string {
 	return ""
 }
 
-type toolDef struct {
-	Type     string `json:"type"`
-	Function struct {
-		Name        string          `json:"name"`
-		Description string          `json:"description"`
-		Parameters  json.RawMessage `json:"parameters"`
-	} `json:"function"`
-}
-
-const (
-	shellToolName     = "run_shell_command"
-	questionToolName  = "question"
-	viewImageToolName = "view_image"
-)
-
-func runShellCommandTool() toolDef {
-	var t toolDef
-	t.Type = "function"
-	t.Function.Name = shellToolName
-	t.Function.Description = "Run a shell command in the user's POSIX environment via sh -c and get its stdout/stderr/exit code."
-	t.Function.Parameters = json.RawMessage(`{
-		"type": "object",
-		"properties": {
-			"command": {
-				"type": "string",
-				"description": "Single-line command for sh -c"
-			}
-		},
-		"required": ["command"]
-	}`)
-	return t
-}
-
-func questionTool() toolDef {
-	var t toolDef
-	t.Type = "function"
-	t.Function.Name = questionToolName
-	t.Function.Description = "Ask the user a question, offer a choice of options, or request clarification/input."
-	t.Function.Parameters = json.RawMessage(`{
-		"type": "object",
-		"properties": {
-			"question": {
-				"type": "string",
-				"description": "Question text for the user"
-			},
-			"options": {
-				"type": "array",
-				"items": {
-					"type": "string"
-				},
-				"description": "List of options for the user to choose from (optional)"
-			},
-			"default": {
-				"type": "string",
-				"description": "Default option or value on Enter (optional)"
-			}
-		},
-		"required": ["question"]
-	}`)
-	return t
-}
-
-func viewImageTool() toolDef {
-	var t toolDef
-	t.Type = "function"
-	t.Function.Name = viewImageToolName
-	t.Function.Description = "Look at a local image file (PNG, JPEG, WebP, GIF) to analyze the picture, read text (OCR), or inspect graphics."
-	t.Function.Parameters = json.RawMessage(`{
-		"type": "object",
-		"properties": {
-			"path": {
-				"type": "string",
-				"description": "Path to the image file (relative or absolute)"
-			}
-		},
-		"required": ["path"]
-	}`)
-	return t
-}
-
-// requestTools собирает набор инструментов для запроса. view_image отдаём
-// только если поддержка vision не опровергнута (Profile.Vision == false):
-// слепой модели схема ни к чему, она всё равно получит ошибку.
-func requestTools(p Profile, force bool) []toolDef {
-	if !p.UseTools && !force {
-		return nil
-	}
-	tools := []toolDef{runShellCommandTool(), questionTool()}
-	if p.Vision == nil || *p.Vision {
-		tools = append(tools, viewImageTool())
-	}
-	return tools
-}
-
 func encodeImageFile(path string) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", err
 	}
+	return encodeImageData(path, data)
+}
+
+func encodeImageData(path string, data []byte) (string, error) {
 	if len(data) > 20<<20 {
-		return "", fmt.Errorf(M.ImageBig)
+		return "", errors.New(M.ImageBig)
 	}
 	mime := http.DetectContentType(data)
-	ext := strings.ToLower(filepath.Ext(path))
-	switch ext {
+	switch strings.ToLower(filepath.Ext(path)) {
 	case ".png":
 		mime = "image/png"
 	case ".jpg", ".jpeg":
@@ -197,18 +125,15 @@ func encodeImageFile(path string) (string, error) {
 	if !strings.HasPrefix(mime, "image/") {
 		return "", fmt.Errorf(M.ImageType, path, mime)
 	}
-	b64 := base64.StdEncoding.EncodeToString(data)
-	return fmt.Sprintf("data:%s;base64,%s", mime, b64), nil
+	return fmt.Sprintf("data:%s;base64,%s", mime, base64.StdEncoding.EncodeToString(data)), nil
 }
 
 type chatRequest struct {
-	Model             string        `json:"model"`
-	Messages          []chatMessage `json:"messages"`
-	Stream            bool          `json:"stream"`
-	Tools             []toolDef     `json:"tools,omitempty"`
-	ReasoningEffort   string        `json:"reasoning_effort,omitempty"`
-	ReasoningBudget   *int          `json:"reasoning_budget,omitempty"`
-	MaxThinkingTokens *int          `json:"max_thinking_tokens,omitempty"`
+	Model           string        `json:"model"`
+	Messages        []chatMessage `json:"messages"`
+	Stream          bool          `json:"stream"`
+	Tools           []toolDef     `json:"tools,omitempty"`
+	ReasoningEffort string        `json:"reasoning_effort,omitempty"`
 }
 
 type errorBody struct {
@@ -217,25 +142,37 @@ type errorBody struct {
 	Code    any    `json:"code"`
 }
 
+// chatResponse — ответ целиком; бывает у серверов, которые игнорируют
+// stream:true.
 type chatResponse struct {
 	Choices []struct {
 		Message struct {
 			Role      string     `json:"role"`
 			Content   string     `json:"content"`
 			ToolCalls []toolCall `json:"tool_calls"`
-			// reasoning-модели (deepseek-r1 и родня) кладут текст сюда,
-			// а content оставляют пустым
-			ReasoningContent string `json:"reasoning_content"`
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Error *errorBody `json:"error,omitempty"`
 }
 
-type modelsResponse struct {
-	Data []struct {
-		ID string `json:"id"`
-	} `json:"data"`
+// streamChunk — одно SSE-событие chat.completion.chunk.
+type streamChunk struct {
+	Choices []struct {
+		Delta struct {
+			Content   string `json:"content"`
+			ToolCalls []struct {
+				Index    *int   `json:"index"`
+				ID       string `json:"id"`
+				Type     string `json:"type"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
+		} `json:"delta"`
+		FinishReason *string `json:"finish_reason"`
+	} `json:"choices"`
 	Error *errorBody `json:"error,omitempty"`
 }
 
@@ -244,24 +181,33 @@ type modelsResponse struct {
 type errKind int
 
 const (
-	errOther errKind = iota
-	errTransport
-	errAuth
+	errOther     errKind = iota
+	errConnect           // не достучались до хоста: он общий для всех моделей профиля
+	errTransport         // оборвалось посреди ответа
+	errTimeout           // провайдер замолчал дольше таймаута тишины
+	errAuth              // 401: ключ не принят — воспроизведётся на любой модели
+	errForbidden         // 403: часто доступ к конкретной модели, у роутеров — правила ключа
+	errQuota             // 402 или 429 с quota/billing: ждать бесполезно, но :free модели могут работать
 	errRateLimit
 	errServer
 	errModelMissing
 	errContextOverflow
+	errNoImages  // модель не принимает картинки — чиним запрос
+	errNoTools   // модель не умеет tools — помечаем в конфиге
+	errBadEffort // модель не принимает такой reasoning_effort — чиним запрос
+	errTooLarge  // 413: лимит обычно у прокси, одинаковый для всех моделей
 	errBadRequest
 	errNotFound
 	errConfig // кривой конфиг: повторять и переключать модель бессмысленно
 )
 
 type apiError struct {
-	kind   errKind
-	status int
-	msg    string
-	url    string
-	model  string
+	kind       errKind
+	status     int
+	msg        string
+	url        string
+	model      string
+	retryAfter time.Duration // из заголовка Retry-After, 0 — не было
 }
 
 func (e *apiError) Error() string {
@@ -271,6 +217,8 @@ func (e *apiError) Error() string {
 		fmt.Fprintf(&b, "HTTP %d", e.status)
 	case e.kind == errConfig:
 		b.WriteString(M.ErrSetup)
+	case e.kind == errTimeout:
+		b.WriteString(M.ErrTimeout)
 	default:
 		b.WriteString(M.ErrNoConn)
 	}
@@ -293,14 +241,26 @@ func (e *apiError) short() string {
 		return fmt.Sprintf("HTTP %d", e.status)
 	case e.kind == errConfig:
 		return M.ErrShort
+	case e.kind == errTimeout:
+		return M.ErrTimeout
 	}
 	return M.NoConn
+}
+
+// reason — причина для строки «X не ответил (…), пробую Y».
+func (e *apiError) reason() string {
+	if e.kind == errContextOverflow {
+		return M.ErrShortCtx
+	}
+	return e.short()
 }
 
 func (e *apiError) hint() string {
 	switch e.kind {
 	case errAuth:
 		return M.HintAuth
+	case errForbidden:
+		return M.HintForbidden
 	case errNotFound:
 		return M.HintURL
 	case errModelMissing:
@@ -309,38 +269,69 @@ func (e *apiError) hint() string {
 		return M.HintCtx
 	case errRateLimit:
 		return M.HintRate
-	case errTransport:
+	case errConnect, errTransport, errTimeout:
 		return M.HintNet
+	case errQuota:
+		return M.HintQuota
+	case errTooLarge:
+		return M.HintTooLarge
 	}
 	return ""
 }
 
-// retryable — есть смысл повторить тот же запрос к той же модели.
-func (e *apiError) retryable() bool {
+// attempts — сколько всего раз пробовать ту же модель. Таймаут тишины не
+// повторяем: модель, промолчавшая 90 секунд, скорее всего промолчит и
+// второй раз.
+func (e *apiError) attempts() int {
 	switch e.kind {
-	case errTransport, errRateLimit, errServer:
+	case errConnect, errRateLimit:
+		return 2
+	case errServer:
+		if e.status == 500 || e.status == 0 {
+			return 2
+		}
+		return 3 // 502/503/504/529 — перегруз или шлюз, обычно проходит
+	case errTransport:
+		return 3
+	}
+	return 1
+}
+
+// tryNextModel — есть смысл перейти к следующей модели цепочки. Хост,
+// ключ, кривой запрос и лимит прокси общие для всех моделей профиля —
+// на них цепочку не перебираем.
+func (e *apiError) tryNextModel() bool {
+	switch e.kind {
+	case errTransport, errTimeout, errForbidden, errQuota, errRateLimit, errServer, errModelMissing:
 		return true
 	}
 	return false
 }
 
-// tryNextModel — есть смысл перейти к следующей модели цепочки.
-// Ошибка ключа или переполнение контекста воспроизведутся на любой
-// модели того же профиля, так что цепочку они не запускают.
-func (e *apiError) tryNextModel() bool {
-	return e.retryable() || e.kind == errModelMissing
-}
-
+// classify — вид ошибки по статусу и тексту тела: провайдеры отдают 400 на
+// очень разные вещи. Подстроки неточные и пополняются по мере встречи.
 func classify(status int, body string) errKind {
 	low := strings.ToLower(body)
+	quota := containsAny(low, "quota", "billing", "credit", "insufficient_funds", "payment")
 	switch {
-	case status == 401 || status == 403:
+	case status == 401:
 		return errAuth
+	case status == 402:
+		return errQuota
+	case status == 403:
+		return errForbidden
+	case status == 408:
+		return errServer
+	case status == 413:
+		return errTooLarge
+	case status == 429 && quota:
+		return errQuota
 	case status == 429:
 		return errRateLimit
 	case status >= 500:
 		return errServer
 	}
+	notSupported := containsAny(low, "not support", "unsupported", "not accept", "not enabled", "not available", "not allowed")
 	if containsAny(low, "context length", "context_length", "maximum context", "too many tokens",
 		"reduce the length", "context window", "prompt is too long") {
 		return errContextOverflow
@@ -351,6 +342,17 @@ func classify(status int, body string) errKind {
 		// пытаются скачать её с HuggingFace и отдают его 404
 		"repository not found") {
 		return errModelMissing
+	}
+	if status >= 400 || status == 0 {
+		switch {
+		case strings.Contains(low, "image") && notSupported:
+			return errNoImages
+		case containsAny(low, "tool", "function call") && notSupported:
+			return errNoTools
+		case containsAny(low, "reasoning", "effort") &&
+			(notSupported || containsAny(low, "invalid", "must be one of", "unknown", "expected")):
+			return errBadEffort
+		}
 	}
 	if status == 404 {
 		return errNotFound
@@ -372,8 +374,27 @@ func containsAny(s string, subs ...string) bool {
 
 // --- транспорт ---
 
+// Клиенты кэшируются по прокси: tool-цикл делает десятки запросов подряд,
+// и без переиспользования соединений каждый шаг платил за TCP+TLS заново.
+var (
+	clientsMu sync.Mutex
+	clients   = map[string]*http.Client{}
+)
+
 func httpClient(p Profile) (*http.Client, error) {
-	transport := &http.Transport{}
+	clientsMu.Lock()
+	defer clientsMu.Unlock()
+	if c, ok := clients[p.Proxy]; ok {
+		return c, nil
+	}
+	transport := &http.Transport{
+		DialContext:           (&net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   dialTimeout,
+		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConnsPerHost:   4,
+		ForceAttemptHTTP2:     true,
+		ExpectContinueTimeout: time.Second,
+	}
 	if p.Proxy != "" {
 		u, err := url.Parse(p.Proxy)
 		if err != nil {
@@ -388,56 +409,105 @@ func httpClient(p Profile) (*http.Client, error) {
 	} else {
 		transport.Proxy = http.ProxyFromEnvironment
 	}
-	return &http.Client{Transport: transport, Timeout: httpTimeout}, nil
+	// Общего Timeout нет намеренно: длину ответа ограничивают таймауты
+	// тишины в doStream, а не потолок на весь запрос.
+	c := &http.Client{Transport: transport}
+	clients[p.Proxy] = c
+	return c, nil
 }
 
-func apiRequest(p Profile, method, path string, body []byte, model string) ([]byte, error) {
+func newRequest(p Profile, ctx context.Context, method, path string, body []byte, model string) (*http.Request, string, error) {
 	endpoint := normalizeBaseURL(p.BaseURL) + path
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, endpoint, &apiError{kind: errConfig, msg: err.Error(), url: endpoint, model: model}
+	}
+	req.Header.Set("Content-Type", "application/json")
+	// Локальным серверам ключ часто не нужен — пустой не отправляем.
+	if p.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	}
+	req.Header.Set("User-Agent", "clank/"+version)
+	return req, endpoint, nil
+}
+
+func statusError(resp *http.Response, endpoint, model string) error {
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	msg := extractErrorMessage(respBody)
+	return &apiError{
+		kind:       classify(resp.StatusCode, msg+" "+string(respBody)),
+		status:     resp.StatusCode,
+		msg:        msg,
+		url:        endpoint,
+		model:      model,
+		retryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+	}
+}
+
+// parseRetryAfter понимает обе формы заголовка: секунды и HTTP-дату.
+func parseRetryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
+// netErrKind — до хоста не достучались (DNS, отказ в соединении, TLS)
+// или соединение оборвалось уже в процессе.
+func netErrKind(err error) errKind {
+	var dnsErr *net.DNSError
+	var opErr *net.OpError
+	if errors.As(err, &dnsErr) || (errors.As(err, &opErr) && opErr.Op == "dial") {
+		return errConnect
+	}
+	if containsAny(strings.ToLower(err.Error()), "tls:", "x509:", "certificate", "proxyconnect") {
+		return errConnect
+	}
+	return errTransport
+}
+
+// apiRequest — простой запрос с ответом целиком (список моделей).
+func apiRequest(p Profile, method, path string, body []byte, model string) ([]byte, error) {
 	client, err := httpClient(p)
 	if err != nil {
 		// Профиль настроен неправильно — ни повтор, ни другая модель
 		// этого не исправят.
-		return nil, &apiError{kind: errConfig, msg: err.Error(), url: endpoint, model: model}
+		return nil, &apiError{kind: errConfig, msg: err.Error(), model: model}
 	}
-
-	req, err := http.NewRequest(method, endpoint, bytes.NewReader(body))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*firstEventTimeout)
+	defer cancel()
+	req, endpoint, err := newRequest(p, ctx, method, path, body, model)
 	if err != nil {
-		return nil, &apiError{kind: errTransport, msg: err.Error(), url: endpoint, model: model}
+		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+p.APIKey)
-	req.Header.Set("User-Agent", "clank/"+version)
-
 	detail("%s %s", method, endpoint)
 	started := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, &apiError{kind: errTransport, msg: err.Error(), url: endpoint, model: model}
+		return nil, &apiError{kind: netErrKind(err), msg: err.Error(), url: endpoint, model: model}
 	}
 	defer resp.Body.Close()
-
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, statusError(resp, endpoint, model)
+	}
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, &apiError{kind: errTransport, msg: err.Error(), url: endpoint, model: model}
 	}
 	detail(M.RespDetail, resp.StatusCode, time.Since(started).Seconds(), len(respBody))
-
-	// Любой 2xx считаем успехом: некоторые прокси отвечают 201.
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		msg := extractErrorMessage(respBody)
-		return nil, &apiError{
-			kind:   classify(resp.StatusCode, msg+" "+string(respBody)),
-			status: resp.StatusCode,
-			msg:    msg,
-			url:    endpoint,
-			model:  model,
-		}
-	}
 	return respBody, nil
 }
 
 // extractErrorMessage вытаскивает человеческий текст из тела ошибки.
-// Раньше наружу вываливался сырой JSON целиком.
 func extractErrorMessage(body []byte) string {
 	var wrapped struct {
 		Error   *errorBody `json:"error"`
@@ -465,38 +535,27 @@ type chatResult struct {
 	finishReason string
 }
 
-// chatComplete — один запрос к одной модели.
-func chatComplete(p Profile, model string, messages []chatMessage, useTools bool) (chatResult, error) {
+// reqOpts — то, что зависит от конкретной модели цепочки.
+type reqOpts struct {
+	tools     []toolDef
+	reasoning string // "" — не отправлять, "off" — "none", иначе уровень
+}
+
+// chatComplete — один запрос к одной модели. Ответ принимается потоком,
+// но собирается целиком: выводится всё равно разом.
+func chatComplete(p Profile, model string, messages []chatMessage, opts reqOpts) (chatResult, error) {
 	reqStruct := chatRequest{
 		Model:    model,
 		Messages: messages,
-		Stream:   false,
+		Stream:   true,
+		Tools:    opts.tools,
 	}
-	if useTools := requestTools(p, useTools); useTools != nil {
-		reqStruct.Tools = useTools
-	}
-	if p.Reasoning != nil {
-		if *p.Reasoning {
-			if p.ReasoningBudget > 0 {
-				b := p.ReasoningBudget
-				reqStruct.ReasoningBudget = &b
-				reqStruct.MaxThinkingTokens = &b
-			} else if p.ReasoningEffort != "" {
-				reqStruct.ReasoningEffort = p.ReasoningEffort
-			} else {
-				reqStruct.ReasoningEffort = "max"
-			}
-		} else {
-			if p.ReasoningBudget > 0 {
-				b := 0
-				reqStruct.ReasoningBudget = &b
-				reqStruct.MaxThinkingTokens = &b
-			} else if p.ReasoningEffort != "" {
-				reqStruct.ReasoningEffort = p.ReasoningEffort
-			} else {
-				reqStruct.ReasoningEffort = "none"
-			}
-		}
+	switch opts.reasoning {
+	case "":
+	case "off":
+		reqStruct.ReasoningEffort = "none"
+	default:
+		reqStruct.ReasoningEffort = opts.reasoning
 	}
 	reqBody, err := json.Marshal(reqStruct)
 	if err != nil {
@@ -504,15 +563,201 @@ func chatComplete(p Profile, model string, messages []chatMessage, useTools bool
 	}
 	detail(M.ReqDetail, model, len(messages), len(reqBody))
 
-	respBody, err := apiRequest(p, http.MethodPost, "/v1/chat/completions", reqBody, model)
+	res, err := doStream(p, model, reqBody)
 	if err != nil {
 		return chatResult{}, err
 	}
+	// Размышления (теги <think> в тексте) никогда не подставляются в ответ
+	// пользователю; reasoning_content в потоке просто не собираем.
+	if s, ok := res.msg.Content.(string); ok {
+		res.msg.Content = stripThinkBlocks(s)
+		if res.msg.Content == "" {
+			res.msg.Content = nil
+		}
+	}
+	return res, nil
+}
 
+// doStream отправляет запрос и читает SSE. Таймер тишины перезаводится
+// на каждой строке потока (включая keep-alive комментарии): длинный ответ
+// живёт сколько угодно, а провайдер, который замолчал, отваливается
+// через idleEventTimeout.
+func doStream(p Profile, model string, body []byte) (chatResult, error) {
+	client, err := httpClient(p)
+	if err != nil {
+		return chatResult{}, &apiError{kind: errConfig, msg: err.Error(), model: model}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var timedOut atomic.Bool
+	timer := time.AfterFunc(firstEventTimeout, func() {
+		timedOut.Store(true)
+		cancel()
+	})
+	defer timer.Stop()
+
+	req, endpoint, err := newRequest(p, ctx, http.MethodPost, "/v1/chat/completions", body, model)
+	if err != nil {
+		return chatResult{}, err
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	detail("POST %s", endpoint)
+	started := time.Now()
+
+	wrap := func(err error) error {
+		if timedOut.Load() {
+			return &apiError{kind: errTimeout, msg: fmt.Sprintf(M.SilentFor, time.Since(started).Round(time.Second)), url: endpoint, model: model}
+		}
+		return &apiError{kind: errTransport, msg: err.Error(), url: endpoint, model: model}
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		if !timedOut.Load() && netErrKind(err) == errConnect {
+			return chatResult{}, &apiError{kind: errConnect, msg: err.Error(), url: endpoint, model: model}
+		}
+		return chatResult{}, wrap(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return chatResult{}, statusError(resp, endpoint, model)
+	}
+
+	if !strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "event-stream") {
+		// Сервер проигнорировал stream:true и прислал ответ целиком.
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return chatResult{}, wrap(err)
+		}
+		detail(M.RespDetail, resp.StatusCode, time.Since(started).Seconds(), len(data))
+		return parseWholeResponse(data, model)
+	}
+
+	var (
+		acc    streamAcc
+		events int
+		bytesN int
+	)
+	rd := bufio.NewReader(resp.Body)
+	for {
+		line, err := rd.ReadString('\n')
+		if len(line) > 0 {
+			timer.Reset(idleEventTimeout)
+			bytesN += len(line)
+		}
+		if err != nil && !(errors.Is(err, io.EOF) && line != "") {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return chatResult{}, wrap(err)
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" || strings.HasPrefix(line, ":") || !strings.HasPrefix(line, "data:") {
+			if err != nil {
+				break
+			}
+			continue // пустые строки, keep-alive комментарии, event:/id:
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "[DONE]" {
+			break
+		}
+		events++
+		var ch streamChunk
+		if jerr := json.Unmarshal([]byte(payload), &ch); jerr != nil {
+			return chatResult{}, &apiError{kind: errOther, model: model,
+				msg: fmt.Sprintf(M.RespUnpars, jerr, truncateRunes(payload, 200))}
+		}
+		if ch.Error != nil && ch.Error.Message != "" {
+			return chatResult{}, &apiError{kind: classify(0, ch.Error.Message), model: model, msg: ch.Error.Message}
+		}
+		acc.add(ch)
+		if err != nil {
+			break
+		}
+	}
+	detail(M.StreamDetail, events, bytesN, time.Since(started).Seconds())
+	if !acc.gotChoice {
+		return chatResult{}, &apiError{kind: errServer, model: model, msg: M.EmptyChoi}
+	}
+	return acc.result(model), nil
+}
+
+// streamAcc склеивает дельты потока в одно сообщение. Аргументы tool_calls
+// приходят JSON-обрывками и собираются по index; у провайдеров без index
+// новый вызов распознаётся по новому id.
+type streamAcc struct {
+	content   strings.Builder
+	calls     []toolCall
+	byIndex   map[int]int
+	finish    string
+	gotChoice bool
+}
+
+func (a *streamAcc) add(ch streamChunk) {
+	if a.byIndex == nil {
+		a.byIndex = map[int]int{}
+	}
+	for _, c := range ch.Choices {
+		a.gotChoice = true
+		a.content.WriteString(c.Delta.Content)
+		if c.FinishReason != nil && *c.FinishReason != "" {
+			a.finish = *c.FinishReason
+		}
+		for _, d := range c.Delta.ToolCalls {
+			pos := -1
+			if d.Index != nil {
+				if i, ok := a.byIndex[*d.Index]; ok {
+					pos = i
+				}
+			} else if len(a.calls) > 0 && (d.ID == "" || d.ID == a.calls[len(a.calls)-1].ID) {
+				pos = len(a.calls) - 1
+			}
+			if pos >= 0 && d.ID != "" && a.calls[pos].ID != "" && a.calls[pos].ID != d.ID {
+				pos = -1 // тот же index, но другой id — значит новый вызов
+			}
+			if pos < 0 {
+				a.calls = append(a.calls, toolCall{})
+				pos = len(a.calls) - 1
+				if d.Index != nil {
+					a.byIndex[*d.Index] = pos
+				}
+			}
+			tc := &a.calls[pos]
+			if d.ID != "" {
+				tc.ID = d.ID
+			}
+			if d.Type != "" {
+				tc.Type = d.Type
+			}
+			tc.Function.Name += d.Function.Name
+			tc.Function.Arguments += d.Function.Arguments
+		}
+	}
+}
+
+func (a *streamAcc) result(model string) chatResult {
+	msg := chatMessage{Role: "assistant"}
+	if s := a.content.String(); s != "" {
+		msg.Content = s
+	}
+	for i := range a.calls {
+		if a.calls[i].Type == "" {
+			a.calls[i].Type = "function"
+		}
+		if a.calls[i].ID == "" {
+			a.calls[i].ID = fmt.Sprintf("call_%d", i)
+		}
+	}
+	msg.ToolCalls = a.calls
+	return chatResult{msg: msg, model: model, finishReason: a.finish}
+}
+
+func parseWholeResponse(data []byte, model string) (chatResult, error) {
 	var parsed chatResponse
-	if err := json.Unmarshal(respBody, &parsed); err != nil {
+	if err := json.Unmarshal(data, &parsed); err != nil {
 		return chatResult{}, &apiError{kind: errOther, model: model,
-			msg: fmt.Sprintf(M.RespUnpars, err, truncateRunes(string(respBody), 200))}
+			msg: fmt.Sprintf(M.RespUnpars, err, truncateRunes(string(data), 200))}
 	}
 	if parsed.Error != nil && parsed.Error.Message != "" {
 		return chatResult{}, &apiError{kind: classify(0, parsed.Error.Message), model: model, msg: parsed.Error.Message}
@@ -520,28 +765,18 @@ func chatComplete(p Profile, model string, messages []chatMessage, useTools bool
 	if len(parsed.Choices) == 0 {
 		return chatResult{}, &apiError{kind: errServer, model: model, msg: M.EmptyChoi}
 	}
-
 	c := parsed.Choices[0]
-	// Размышления (reasoning_content и теги <think>) никогда не подставляются
-	// в ответ пользователю.
-	content := stripThinkBlocks(c.Message.Content)
-
-	return chatResult{
-		msg: chatMessage{
-			Role:      "assistant",
-			Content:   content,
-			ToolCalls: c.Message.ToolCalls,
-		},
-		model:        model,
-		finishReason: c.FinishReason,
-	}, nil
+	msg := chatMessage{Role: "assistant", ToolCalls: c.Message.ToolCalls}
+	if c.Message.Content != "" {
+		msg.Content = c.Message.Content
+	}
+	return chatResult{msg: msg, model: model, finishReason: c.FinishReason}, nil
 }
 
 // stripThinkBlocks убирает <think>…</think>, <thought>…</thought>,
 // <reasoning>…</reasoning>: размышления не должны засорять вывод пользователю.
 func stripThinkBlocks(s string) string {
-	tags := []string{"think", "thought", "reasoning"}
-	for _, tag := range tags {
+	for _, tag := range []string{"think", "thought", "reasoning"} {
 		open := "<" + tag + ">"
 		close := "</" + tag + ">"
 		for {
@@ -562,230 +797,265 @@ func stripThinkBlocks(s string) string {
 	return strings.TrimSpace(s)
 }
 
-// chatWithFallback идёт по цепочке моделей профиля. Переключается только
-// на технических отказах (сеть, 5xx, 429, нет такой модели) — «плохой по
-// смыслу» ответ фоллбэк не запускает, иначе каждый неудачный ответ молча
-// прожигал бы всю цепочку.
-func chatWithFallback(p Profile, messages []chatMessage, useTools bool) (chatResult, error) {
-	if len(p.Models) == 0 {
-		return chatResult{}, fmt.Errorf(M.NoModels)
+// chatWithFallback идёт по цепочке моделей. Переключается только на
+// технических отказах — «плохой по смыслу» ответ фоллбэк не запускает.
+// Часть отказов чинится на месте: картинки вырезаются, непринятый
+// reasoning_effort убирается. При переполнении контекста дальше идут
+// только модели с бóльшим контекстом. Возвращает индекс ответившей
+// модели в chain, чтобы вызывающий продолжил с неё.
+func chatWithFallback(p Profile, chain []ModelEntry, build func(ModelEntry) ([]chatMessage, reqOpts)) (chatResult, int, error) {
+	if len(chain) == 0 {
+		return chatResult{}, -1, errors.New(M.NoModels)
 	}
 
 	var (
 		attempts []string
 		lastErr  error
+		ctxFloor = -1 // после переполнения: годятся только модели с Context больше
 	)
-	for i, model := range p.Models {
-		res, err := chatCompleteRetry(p, model, messages, useTools)
+	eligible := func(m ModelEntry) bool { return ctxFloor < 0 || m.Context > ctxFloor }
+	next := func(i int) int {
+		for j := i + 1; j < len(chain); j++ {
+			if eligible(chain[j]) {
+				return j
+			}
+		}
+		return -1
+	}
+
+	for i, m := range chain {
+		if !eligible(m) {
+			continue
+		}
+		msgs, opts := build(m)
+		var (
+			res chatResult
+			err error
+		)
+		for {
+			res, err = chatCompleteRetry(p, m.ID, msgs, opts)
+			ae, ok := err.(*apiError)
+			if !ok {
+				break
+			}
+			if ae.kind == errNoImages && hasImages(msgs) {
+				msgs = stripImages(msgs)
+				noteImagesDropped()
+				continue
+			}
+			if ae.kind == errBadEffort && opts.reasoning != "" {
+				warn(M.EffortDropped, m.ID, opts.reasoning)
+				opts.reasoning = ""
+				continue
+			}
+			break
+		}
 		if err == nil {
 			if i > 0 {
-				info(M.Answering, model)
+				info(M.Answering, m.label())
 			}
-			return res, nil
+			return res, i, nil
 		}
 		lastErr = err
 
 		ae, ok := err.(*apiError)
 		if !ok {
-			return chatResult{}, err
+			return chatResult{}, -1, err
 		}
-		attempts = append(attempts, fmt.Sprintf("%s — %s", model, ae.short()))
-		if !ae.tryNextModel() {
-			return chatResult{}, err
+		attempts = append(attempts, fmt.Sprintf("%s — %s", m.ID, ae.reason()))
+
+		if ae.kind == errContextOverflow {
+			if m.Context == 0 {
+				return chatResult{}, -1, fmt.Errorf(M.CtxUnknown, err, m.ID, m.ID)
+			}
+			ctxFloor = m.Context
+			if next(i) < 0 {
+				return chatResult{}, -1, fmt.Errorf(M.CtxNoBigger, err, m.ID)
+			}
+		} else if !ae.tryNextModel() {
+			return chatResult{}, -1, err
 		}
-		if i < len(p.Models)-1 {
-			info(M.ModelFail, model, ae.short(), p.Models[i+1])
+		if j := next(i); j >= 0 {
+			info(M.ModelFail, m.label(), ae.reason(), chain[j].label())
 		}
 	}
 
 	// При единственной модели список попыток ничего не добавляет, а
 	// подсказку из исходной ошибки терять жалко.
 	if len(attempts) == 1 {
-		return chatResult{}, lastErr
+		return chatResult{}, -1, lastErr
 	}
-	return chatResult{}, fmt.Errorf(M.NoAnswer,
-		strings.Join(attempts, "\n  "), lastErr)
+	return chatResult{}, -1, fmt.Errorf(M.NoAnswer, strings.Join(attempts, "\n  "), lastErr)
 }
 
-// chatCompleteRetry повторяет запрос при временных отказах: 429 и 5xx у
-// публичных провайдеров — штатная ситуация, ронять из-за них весь ход глупо.
-func chatCompleteRetry(p Profile, model string, messages []chatMessage, useTools bool) (chatResult, error) {
-	var lastErr error
+// rotateChain ставит ответившую модель в начало, остальные идут за ней по
+// кругу: дальше в этом запуске работаем с рабочей моделью, а если упадёт
+// и она — пробуем остальные, включая те, что были до неё.
+func rotateChain(chain []ModelEntry, i int) []ModelEntry {
+	if i <= 0 || i >= len(chain) {
+		return chain
+	}
+	out := make([]ModelEntry, 0, len(chain))
+	out = append(out, chain[i:]...)
+	return append(out, chain[:i]...)
+}
+
+// chatCompleteRetry повторяет запрос при временных отказах. Retry-After
+// уважаем, но дольше maxRetryWait не ждём — тогда лучше другая модель.
+func chatCompleteRetry(p Profile, model string, messages []chatMessage, opts reqOpts) (chatResult, error) {
 	backoff := time.Second
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		res, err := chatComplete(p, model, messages, useTools)
+	for attempt := 1; ; attempt++ {
+		res, err := chatComplete(p, model, messages, opts)
 		if err == nil {
 			return res, nil
 		}
-		lastErr = err
-
 		ae, ok := err.(*apiError)
-		if !ok || !ae.retryable() || attempt == maxRetries {
+		if !ok || attempt >= ae.attempts() {
 			return chatResult{}, err
 		}
-		info(M.RetryIn, model, ae.short(), backoff, attempt, maxRetries-1)
-		time.Sleep(backoff)
+		wait := backoff
+		if ae.retryAfter > 0 {
+			if ae.retryAfter > maxRetryWait {
+				return chatResult{}, err
+			}
+			wait = ae.retryAfter
+		}
+		info(M.RetryIn, model, ae.short(), wait.Round(time.Second), attempt, ae.attempts()-1)
+		time.Sleep(wait)
 		backoff *= 2
 	}
-	return chatResult{}, lastErr
 }
 
-func listModels(p Profile) ([]string, error) {
+// --- картинки ---
+
+var imagesNoted bool
+
+// noteImagesDropped — один раз за запуск: дальше по шагам картинки
+// вырезаются молча.
+func noteImagesDropped() {
+	if !imagesNoted {
+		imagesNoted = true
+		warn(M.ImagesDropped)
+	}
+}
+
+func isImagePart(t string) bool { return t == "image_url" || t == "image" || t == "input_image" }
+
+func hasImages(msgs []chatMessage) bool {
+	for _, m := range msgs {
+		switch c := m.Content.(type) {
+		case []contentPart:
+			for _, p := range c {
+				if isImagePart(p.Type) {
+					return true
+				}
+			}
+		case []any:
+			for _, p := range c {
+				if pm, ok := p.(map[string]any); ok {
+					if t, _ := pm["type"].(string); isImagePart(t) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+// stripImages — копия диалога без картинок; сам диалог не трогаем, чтобы
+// модели с vision дальше их видели. Сообщение, от которого остались
+// одни картинки, становится текстовой пометкой.
+func stripImages(msgs []chatMessage) []chatMessage {
+	out := make([]chatMessage, len(msgs))
+	for i, m := range msgs {
+		out[i] = m
+		var texts []string
+		dropped := false
+		switch c := m.Content.(type) {
+		case []contentPart:
+			for _, p := range c {
+				if isImagePart(p.Type) {
+					dropped = true
+				} else if p.Text != "" {
+					texts = append(texts, p.Text)
+				}
+			}
+		case []any:
+			for _, p := range c {
+				pm, ok := p.(map[string]any)
+				if !ok {
+					continue
+				}
+				if t, _ := pm["type"].(string); isImagePart(t) {
+					dropped = true
+				} else if txt, _ := pm["text"].(string); txt != "" {
+					texts = append(texts, txt)
+				}
+			}
+		default:
+			continue
+		}
+		if !dropped {
+			continue
+		}
+		text := strings.Join(texts, "\n")
+		if text == "" {
+			text = "[image omitted: this model does not accept images]"
+		}
+		out[i].Content = text
+	}
+	return out
+}
+
+// remoteModel — модель из /v1/models. Поля сверх id отдают не все: это
+// формат роутеров в стиле OpenRouter. Чего нет — то нулевое.
+type remoteModel struct {
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	ContextLength int    `json:"context_length"`
+	Architecture  struct {
+		InputModalities  []string `json:"input_modalities"`
+		OutputModalities []string `json:"output_modalities"`
+	} `json:"architecture"`
+	Reasoning *struct {
+		SupportedEfforts []string `json:"supported_efforts"`
+		DefaultEffort    string   `json:"default_effort"`
+	} `json:"reasoning"`
+	SupportedParameters []string `json:"supported_parameters"`
+}
+
+// textOutput — модель выдаёт текст. Без метаданных считаем, что да.
+func (m remoteModel) textOutput() bool {
+	if len(m.Architecture.OutputModalities) == 0 {
+		return true
+	}
+	return containsString(m.Architecture.OutputModalities, "text")
+}
+
+func containsString(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+func listModels(p Profile) ([]remoteModel, error) {
 	respBody, err := apiRequest(p, http.MethodGet, "/v1/models", nil, "")
 	if err != nil {
 		return nil, err
 	}
-	var parsed modelsResponse
+	var parsed struct {
+		Data  []remoteModel `json:"data"`
+		Error *errorBody    `json:"error,omitempty"`
+	}
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
 		return nil, fmt.Errorf(M.ModelsUnp, err)
 	}
 	if parsed.Error != nil && parsed.Error.Message != "" {
 		return nil, fmt.Errorf(M.APIError, parsed.Error.Message)
 	}
-	ids := make([]string, 0, len(parsed.Data))
-	for _, m := range parsed.Data {
-		ids = append(ids, m.ID)
-	}
-	return ids, nil
-}
-
-// testToolSupport — эвристическая проверка: просим модель что-то, для
-// чего "честный" ответ требует вызова инструмента, и смотрим, вызвала
-// ли она tool_call. Не 100% надёжно (мелкие модели ведут себя по-разному),
-// поэтому результат перед сохранением подтверждается пользователем.
-func testToolSupport(p Profile, model string) (ok bool, detailText string, err error) {
-	sys := chatMessage{
-		Role:    "system",
-		Content: M.ToolProbeS,
-	}
-	user := chatMessage{
-		Role:    "user",
-		Content: M.ToolProbeU,
-	}
-	res, err := chatComplete(p, model, []chatMessage{sys, user}, true)
-	if err != nil {
-		return false, "", err
-	}
-	if len(res.msg.ToolCalls) > 0 {
-		tc := res.msg.ToolCalls[0]
-		return true, fmt.Sprintf("%s(%s)", tc.Function.Name, tc.Function.Arguments), nil
-	}
-	return false, res.msg.Text(), nil
-}
-
-type reasoningTestResult struct {
-	EffortOn   string
-	EffortOff  string
-	BudgetOn   int
-	BudgetOff  int
-	UsesBudget bool
-	HasOutput  bool
-}
-
-func testReasoningSupport(p Profile, model string) (reasoningTestResult, error) {
-	var res reasoningTestResult
-
-	sendTest := func(reqStruct chatRequest) (chatResponse, error) {
-		reqBody, err := json.Marshal(reqStruct)
-		if err != nil {
-			return chatResponse{}, err
-		}
-		respBody, err := apiRequest(p, http.MethodPost, "/v1/chat/completions", reqBody, model)
-		if err != nil {
-			return chatResponse{}, err
-		}
-		var parsed chatResponse
-		if err := json.Unmarshal(respBody, &parsed); err != nil {
-			return chatResponse{}, err
-		}
-		return parsed, nil
-	}
-
-	baseMsg := []chatMessage{{Role: "user", Content: "2+2=? Reply with the digit only / Ответь только цифрой"}}
-
-	// 1. Тестируем effort для ON в порядке: max, ultra, xhigh, high
-	for _, val := range []string{"max", "ultra", "xhigh", "high"} {
-		resp, err := sendTest(chatRequest{Model: model, Messages: baseMsg, ReasoningEffort: val})
-		if err == nil {
-			res.EffortOn = val
-			if len(resp.Choices) > 0 {
-				c := resp.Choices[0].Message
-				if c.ReasoningContent != "" || strings.Contains(c.Content, "<think>") || strings.Contains(c.Content, "<thought>") {
-					res.HasOutput = true
-				}
-			}
-			break
-		}
-	}
-
-	// 2. Тестируем effort для OFF в порядке: none, minimal, low
-	for _, val := range []string{"none", "minimal", "low"} {
-		_, err := sendTest(chatRequest{Model: model, Messages: baseMsg, ReasoningEffort: val})
-		if err == nil {
-			res.EffortOff = val
-			break
-		}
-	}
-
-	// 3. Если effort не поддержан, пробуем reasoning_budget / max_thinking_tokens
-	if res.EffortOn == "" && res.EffortOff == "" {
-		bOn := 1024
-		resp, err := sendTest(chatRequest{Model: model, Messages: baseMsg, ReasoningBudget: &bOn})
-		if err == nil {
-			res.UsesBudget = true
-			res.BudgetOn = 32768
-			res.BudgetOff = 0
-			if len(resp.Choices) > 0 {
-				c := resp.Choices[0].Message
-				if c.ReasoningContent != "" || strings.Contains(c.Content, "<think>") || strings.Contains(c.Content, "<thought>") {
-					res.HasOutput = true
-				}
-			}
-		} else {
-			resp, err := sendTest(chatRequest{Model: model, Messages: baseMsg, MaxThinkingTokens: &bOn})
-			if err == nil {
-				res.UsesBudget = true
-				res.BudgetOn = 32768
-				res.BudgetOff = 0
-				if len(resp.Choices) > 0 {
-					c := resp.Choices[0].Message
-					if c.ReasoningContent != "" || strings.Contains(c.Content, "<think>") || strings.Contains(c.Content, "<thought>") {
-						res.HasOutput = true
-					}
-				}
-			}
-		}
-	}
-
-	// 4. Проверяем без параметров, генерирует ли модель размышления сама по себе
-	if !res.HasOutput {
-		resp, err := sendTest(chatRequest{Model: model, Messages: baseMsg})
-		if err == nil && len(resp.Choices) > 0 {
-			c := resp.Choices[0].Message
-			if c.ReasoningContent != "" || strings.Contains(c.Content, "<think>") || strings.Contains(c.Content, "<thought>") {
-				res.HasOutput = true
-			}
-		}
-	}
-
-	return res, nil
-}
-
-const testPNG32x32Base64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJklEQVR4nO3NsQkAAAjAsP7/tF7hIASyp6ZbAoFAIBAIBAKB4EuwNof8LkGrxSIAAAAASUVORK5CYII="
-
-func testVisionSupport(p Profile, model string) (ok bool, detailText string, err error) {
-	dataURL := "data:image/png;base64," + testPNG32x32Base64
-	userMsg := chatMessage{
-		Role: "user",
-		Content: []contentPart{
-			{Type: "text", Text: M.VisionProb},
-			{Type: "image_url", ImageURL: &imageURL{URL: dataURL}},
-		},
-	}
-	res, err := chatComplete(p, model, []chatMessage{userMsg}, false)
-	if err != nil {
-		return false, "", err
-	}
-	ans := strings.TrimSpace(res.msg.Text())
-	return true, ans, nil
+	return parsed.Data, nil
 }

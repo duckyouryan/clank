@@ -32,11 +32,11 @@ func main() {
 		code = cmdConfig(rest)
 	case "session":
 		code = cmdSession(rest)
-	case "yolo":
-		code = cmdYolo(rest)
+	case "mode":
+		code = cmdMode(rest)
 	case "completion":
 		code = cmdCompletion(rest)
-	case "language":
+	case "lang", "language":
 		code = cmdLanguage(rest)
 	case "update":
 		code = cmdUpdate(rest)

@@ -54,20 +54,6 @@ func askLine(prompt string) (line string, ok bool) {
 	return strings.TrimSpace(s), true
 }
 
-// askLineDefault — вопрос с показом текущего значения; пустой ввод
-// оставляет как было.
-func askLineDefault(label, current, display string) string {
-	prompt := label + ": "
-	if current != "" {
-		prompt = fmt.Sprintf("%s [%s]: ", label, display)
-	}
-	line, ok := askLine(prompt)
-	if !ok || line == "" {
-		return current
-	}
-	return line
-}
-
 // confirmYN перезапрашивает при непонятном ответе, а не считает всё
 // подряд отказом: раньше опечатка или лишний символ молча означали "нет".
 // Пустая строка = defaultYes. EOF (терминал закрыли) = отказ.
@@ -97,53 +83,32 @@ func confirmYN(prompt string, defaultYes bool) bool {
 	}
 }
 
-// answer — исход подтверждения команды.
-type answer int
-
-const (
-	ansNo answer = iota
-	ansYes
-	ansAlways
-)
-
-// confirmCommand печатает команду и спрашивает подтверждение в один и тот
-// же fd — управляющий терминал. Раньше команда уходила в stderr, а вопрос
-// в /dev/tty, и при `clank ... 2>log` пользователь видел только "выполнить?"
-// без текста команды, то есть подтверждал вслепую.
-func confirmCommand(cmdStr, name string, level TrustLevel) answer {
+// confirmTool показывает, что модель хочет сделать, и спрашивает y/N в
+// один и тот же fd — управляющий терминал. Раньше команда уходила в
+// stderr, а вопрос в /dev/tty, и при `clank ... 2>log` пользователь видел
+// только "выполнить?" без текста, то есть подтверждал вслепую. Пустой
+// ввод и EOF — отказ; без терминала подтвердить нельзя — тоже отказ.
+func confirmTool(title, body string) bool {
 	f, rd, err := ttyIO()
 	if err != nil {
 		warn(M.NoTTYDecline)
-		return ansNo
+		return false
 	}
-
-	fmt.Fprintf(f, M.ModelWantsRun, indentBlock(sanitizeForDisplay(cmdStr), "    "))
-	var prompt string
-	if level == TrustSimple {
-		fmt.Fprintf(f, M.ComplexWarn, name)
-		prompt = fmt.Sprintf(M.RunPromptAll, name)
-	} else {
-		prompt = fmt.Sprintf(M.RunPrompt, name)
-	}
-
+	fmt.Fprintf(f, "\n%s\n%s\n", title, body)
 	for {
-		fmt.Fprint(f, prompt)
+		fmt.Fprint(f, M.RunPrompt)
 		line, err := rd.ReadString('\n')
 		if err != nil {
 			fmt.Fprintln(f)
-			return ansNo
+			return false
 		}
 		switch strings.TrimSpace(strings.ToLower(line)) {
-		case "":
-			return ansNo
+		case "", "n", "no", "н", "нет":
+			return false
 		case "y", "yes", "д", "да":
-			return ansYes
-		case "n", "no", "н", "нет":
-			return ansNo
-		case "a", "always", "в", "всегда":
-			return ansAlways
+			return true
 		default:
-			fmt.Fprintln(f, M.ConfirmCMD)
+			fmt.Fprintln(f, M.ConfirmHint)
 		}
 	}
 }
